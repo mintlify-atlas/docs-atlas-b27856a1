@@ -1,0 +1,169 @@
+---
+title: "Aether Sync Data Model: LWW Records and Conflict Resolution"
+sidebarTitle: "Data Model"
+description: "Understand the 3-tuple (value, timestamp, node_id) record structure, how Last-Write-Wins CRDT semantics resolve concurrent writes, and the idempotency guarantees that make gossip retransmission safe."
+---
+
+Aether Sync models distributed state as a **Last-Write-Wins (LWW) Element Dictionary**, one of the simplest and most practical Conflict-free Replicated Data Types (CRDTs). Every node maintains an identical logical structure: a plain Python dictionary whose keys are strings and whose values are fixed-shape 3-tuples. No master node arbitrates writes; any node can write any key at any time, and the merge function guarantees that all nodes converge to the same state regardless of the order in which they receive updates.
+
+## Record structure
+
+Each key in the store maps to a 3-tuple of the form `(value, timestamp, node_id)`:
+
+| Field | Type | Description |
+|---|---|---|
+| `value` | `str` | The application-level payload. Complex types must be serialised to a string (e.g. JSON). |
+| `timestamp` | `float` | Unix epoch timestamp (`time.time()`) recorded at write time on the originating node. |
+| `node_id` | `str` | The string identifier of the node that wrote this version of the record. Used as a deterministic tie-breaker when two writes share the same timestamp. |
+
+A live store looks like this:
+
+```python
+store.data = {
+    "user:42:name":  ("Alice",             1678156800.234, "node-1"),
+    "user:42:email": ("alice@example.com", 1678156805.567, "node-2"),
+    "counter":       ("100",               1678156810.890, "node-3")
+}
+```
+
+The colon-separated key format (`user:42:name`) is a convention, not a constraint enforced by the store — see [Key naming conventions](#key-naming-conventions) below.
+
+## Conflict resolution algorithm
+
+When a `GOSSIP` or `PUT` message arrives, the store's `merge` method reconciles each incoming record against the local copy. Here is the actual implementation from `store.py`:
+
+```python
+def merge(self, remote):
+    with self.lock:
+        for k, incoming in remote.items():
+            if k not in self.data:
+                self.data[k] = tuple(incoming)
+            else:
+                v, ts, n = self.data[k]
+                iv, its, inode = incoming
+                if its > ts or (its == ts and inode > n):
+                    self.data[k] = tuple(incoming)
+```
+
+<Steps>
+  <Step title="Acquire the mutex">
+    `merge` wraps every operation in `self.lock` (a `threading.Lock`). This ensures that concurrent calls from the listener thread and the gossip thread cannot interleave and corrupt the store.
+  </Step>
+  <Step title="Iterate over all incoming records">
+    For each key `k` in the remote dictionary, the algorithm decides whether the incoming tuple replaces the local tuple.
+  </Step>
+  <Step title="Accept new keys unconditionally">
+    If `k` is not yet in `self.data`, the incoming record is inserted directly. No comparison is needed because there is no local version to compete with.
+  </Step>
+  <Step title="Compare timestamps for known keys">
+    When a local record already exists, its timestamp `ts` is compared against the incoming timestamp `its`. If `its > ts`, the incoming record is newer and wins.
+  </Step>
+  <Step title="Break ties using node ID">
+    If `its == ts` (two writes happened at the exact same floating-point second), the string node identifiers are compared lexicographically. The record whose `node_id` is **greater** in lexicographic order wins. For example, `"node-2"` beats `"node-1"`. This rule is deterministic and produces the same outcome on every node regardless of merge order.
+  </Step>
+  <Step title="Discard stale records">
+    If neither condition is true — meaning the local record has a later timestamp, or an equal timestamp with a lexicographically larger node ID — the incoming record is silently discarded. The local value is preserved unchanged.
+  </Step>
+</Steps>
+
+## Idempotency guarantee
+
+The merge predicate `its > ts` is a **strict** greater-than comparison. Re-merging a record that is already stored produces no change:
+
+```python
+# First merge: new key — accepted
+store.merge({"x": ("hello", 1000.0, "node-1")})
+# store.data["x"] == ("hello", 1000.0, "node-1")
+
+# Second merge: identical record — no-op, same result
+store.merge({"x": ("hello", 1000.0, "node-1")})
+# store.data["x"] == ("hello", 1000.0, "node-1")  ← unchanged
+```
+
+This property is essential for the gossip protocol, which broadcasts the **full store** on every cycle. Receiving the same record a second (or tenth) time never corrupts state, making the system safe against:
+
+- Duplicate UDP delivery (rare but possible even without `LOSS_PROB`)
+- Overlapping gossip rounds between peers
+- Restart-and-replay recovery scenarios
+
+## Commutativity
+
+The LWW merge is **commutative**: applying two updates `A` then `B` produces the same final state as applying `B` then `A`. Because the winning record is selected solely by (timestamp, node_id) — values that are intrinsic to each record — the decision never depends on which peer sent the update first or which network path it travelled. Every node therefore converges to the same state even when messages arrive out of order, which is normal over UDP.
+
+```python
+# Node receives update from node-2 before update from node-1
+store.merge({"score": ("200", 1678156802.0, "node-2")})
+store.merge({"score": ("150", 1678156801.0, "node-1")})
+# store.data["score"] == ("200", 1678156802.0, "node-2")
+
+# Different node receives the same two updates in reverse order
+store.merge({"score": ("150", 1678156801.0, "node-1")})
+store.merge({"score": ("200", 1678156802.0, "node-2")})
+# store.data["score"] == ("200", 1678156802.0, "node-2")  ← same result
+```
+
+## Key naming conventions
+
+Aether Sync imposes no structure on key strings; they are plain Python `str` values. The colon-separated namespace convention used in the README and examples is a recommended pattern:
+
+```
+<entity-type>:<entity-id>:<attribute>
+```
+
+For example:
+
+```python
+# User profile attributes
+"user:42:name"        # → ("Alice",     ...)
+"user:42:email"       # → ("alice@...", ...)
+"user:42:role"        # → ("admin",     ...)
+
+# Service configuration
+"config:db_host"      # → ("postgres.internal", ...)
+"config:db_port"      # → ("5432",              ...)
+
+# Feature flags
+"flag:dark_mode"      # → ("true",  ...)
+"flag:beta_search"    # → ("false", ...)
+```
+
+This pattern avoids key collisions across entities and makes it easy to read a logical record by scanning keys with a common prefix. The store has no query or prefix-scan API today; to read a logical object you call `store.get_all()` and filter the returned dictionary in application code.
+
+## Limitations
+
+### No tombstone deletes
+
+The LWW dictionary has no concept of deletion. Once a key is written it exists forever in the store; there is no `delete` operation and no tombstone record type. If you need to logically remove a key, use one of these workarounds:
+
+```python
+# Option 1 — sentinel string value
+store.merge({"user:42:name": ("__DELETED__", time.time(), node_id)})
+
+# Option 2 — separate deletion-timestamp field
+store.merge({"user:42:name:deleted_at": (str(time.time()), time.time(), node_id)})
+```
+
+Application code must then check for the sentinel before treating a value as live.
+
+### String-only values
+
+The `value` field in each 3-tuple is stored as a plain string. Numeric, boolean, and structured data must be serialised before writing and deserialised after reading:
+
+```python
+import json, time
+
+# Writing a structured value
+payload = json.dumps({"lat": 37.77, "lon": -122.41})
+store.merge({"location:device-7": (payload, time.time(), node_id)})
+
+# Reading it back
+all_data = store.get_all()
+record = all_data["location:device-7"]
+location = json.loads(record[0])   # {"lat": 37.77, "lon": -122.41}
+```
+
+Serialising to JSON is safe because the merge logic never inspects the value field — it is treated as an opaque string throughout the conflict resolution process.
+
+<Note>
+  Aether Sync's conflict resolution relies on `time.time()` producing reasonably accurate and monotonically increasing values across all nodes. If clock skew between nodes exceeds a few seconds, an older write on a fast-clock node can permanently beat a newer write on a slow-clock node. **Use NTP (or `chrony`) on every node** to keep clocks within a few milliseconds of each other. In the worst case — equal timestamps — the node-ID tie-breaker still guarantees a deterministic (if arbitrary) outcome, preventing divergence but potentially picking the "wrong" winner from the application's perspective.
+</Note>

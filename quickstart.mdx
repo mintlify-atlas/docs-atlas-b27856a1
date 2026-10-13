@@ -1,47 +1,227 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Aether Sync in Minutes"
+sidebarTitle: "Quickstart"
+description: "Clone the repo, launch three Python processes, connect them with the peer command, and watch CRDT gossip sync state across every node automatically."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through cloning Aether Sync, starting a three-node cluster on your local machine, writing data from one node, and verifying that every peer converges to the same state — all in under five minutes.
 
 ## Prerequisites
 
-Before you begin, you must have:
+- **Python 3.7 or later** — Aether Sync uses `threading.Thread`, f-strings, and `socket.AF_INET` features available since 3.7.
+- **No external packages** — the entire stack is pure Python standard library (`threading`, `socket`, `json`, `random`). There is nothing to `pip install`.
+- **Three terminal windows** — each node is a separate process; you will need one terminal per node.
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Setup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository">
+    Open a terminal and clone the project from GitHub:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/mgurujagannathareddy/aether-sync-resilient-multi-master-state-sync-over-udp.git
+    cd aether-sync-resilient-multi-master-state-sync-over-udp
     ```
+
+    No install step is required. The working directory now contains `node.py`, `store.py`, `transport.py`, `reliability.py`, `gossip.py`, and `config.py`.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Start Node 1">
+    In your first terminal, launch the node process. When prompted, enter the node identifier and UDP port:
 
     ```bash
-    your-cli init
+    python node.py
     ```
+
+    ```
+    Node ID: node-1
+    Port: 5001
+    [p]peer [i]put [s]show :
+    ```
+
+    Node 1 is now listening on `127.0.0.1:5001`. Leave this terminal open — you will add peers and write data from here.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Start Node 2">
+    Open a **second terminal** in the same directory and start another instance:
 
     ```bash
-    your-cli start
+    python node.py
     ```
+
+    ```
+    Node ID: node-2
+    Port: 5002
+    [p]peer [i]put [s]show :
+    ```
+
+    Node 2 listens on `127.0.0.1:5002`.
+  </Step>
+
+  <Step title="Start Node 3">
+    Open a **third terminal** and start the final node:
+
+    ```bash
+    python node.py
+    ```
+
+    ```
+    Node ID: node-3
+    Port: 5003
+    [p]peer [i]put [s]show :
+    ```
+
+    Node 3 listens on `127.0.0.1:5003`.
+  </Step>
+
+  <Step title="Connect the nodes">
+    Each node maintains its own peer list. You need to register peers so each node knows where to gossip and send reliable PUTs. Use the `p` command in each terminal.
+
+    **In Terminal 1 (node-1)** — register node-2 and node-3 as peers:
+
+    ```
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5002
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5003
+    [p]peer [i]put [s]show :
+    ```
+
+    **In Terminal 2 (node-2)** — register node-1 and node-3:
+
+    ```
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5001
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5003
+    [p]peer [i]put [s]show :
+    ```
+
+    **In Terminal 3 (node-3)** — register node-1 and node-2:
+
+    ```
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5001
+    [p]peer [i]put [s]show : p
+    IP: 127.0.0.1
+    Port: 5002
+    [p]peer [i]put [s]show :
+    ```
+
+    All three nodes now form a fully connected mesh.
+  </Step>
+
+  <Step title="Write data and verify sync">
+    **In Terminal 1 (node-1)**, write two key-value pairs using the `i` (insert) command:
+
+    ```
+    [p]peer [i]put [s]show : i
+    key: username
+    value: alice
+    [p]peer [i]put [s]show : i
+    key: email
+    value: alice@example.com
+    [p]peer [i]put [s]show :
+    ```
+
+    Each `i` command calls `Store.merge()` locally, then broadcasts a reliable PUT message to every registered peer. Inspect the local store immediately on node-1 with `s`:
+
+    ```
+    [p]peer [i]put [s]show : s
+    {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
+    ```
+
+    <Tip>
+      Wait at least **3 seconds** before running `s` on node-2 or node-3. The gossip loop fires every `GOSSIP_INTERVAL = 3` seconds (set in `config.py`). If the direct PUT was dropped by the 30 % packet-loss simulation, the anti-entropy gossip cycle will repair it within the next broadcast round.
+    </Tip>
+
+    **In Terminal 2 (node-2)**, confirm convergence:
+
+    ```
+    [p]peer [i]put [s]show : s
+    {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
+    ```
+
+    **In Terminal 3 (node-3)**, same check:
+
+    ```
+    [p]peer [i]put [s]show : s
+    {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
+    ```
+
+    All three nodes now hold identical state. The cluster has achieved **strong eventual consistency** despite the simulated 30 % packet loss.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Command Reference
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Every node exposes three interactive commands at the `[p]peer [i]put [s]show :` prompt:
+
+| Command | Name | Description | Prompts |
+|---------|------|-------------|---------|
+| `p` | Add Peer | Registers a remote node so this node sends PUTs and gossip to it | `IP:`, `Port:` |
+| `i` | Put (Insert / Update) | Merges a key-value pair locally and broadcasts a reliable PUT to all peers | `key:`, `value:` |
+| `s` | Show State | Prints the full CRDT store as a Python dict of `(value, timestamp, node_id)` tuples | — |
+
+## Understanding the Store Output
+
+After running `s`, you will see output like this:
+
+```python
+{'username': ('alice', 1678156800.234, 'node-1')}
+```
+
+Each entry is a **3-tuple** defined in `store.py`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `'alice'` | `str` | The stored value |
+| `1678156800.234` | `float` | Unix timestamp from `time.time()` at write time on the originating node |
+| `'node-1'` | `str` | Node ID of the last writer — used as a tie-breaker when timestamps are equal |
+
+When two nodes write different values for the same key concurrently, `Store.merge()` always picks the record with the higher timestamp. If timestamps are identical, the lexicographically larger node ID wins — making conflict resolution fully deterministic and requiring no locks or consensus quorum.
+
+<Tip>
+  To observe conflict resolution in action, write the same key from two different nodes within the same second. After a gossip cycle, both nodes will converge to the value whose `(timestamp, node_id)` pair sorts highest.
 </Tip>
+
+## What Happens Behind the Scenes
+
+When you type `i` on node-1, `node.py` executes this sequence:
+
+```python
+# From node.py — user_loop()
+ts = time.time()
+store.merge({k: (v, ts, NODE_ID)})          # 1. write locally
+
+msg = {"type": "PUT", "from": NODE_ID,
+       "key": k, "value": v, "ts": ts}
+
+for p in peers:
+    reliability.reliable_send(msg, p)        # 2. send to each peer with ACK tracking
+```
+
+`reliability.reliable_send()` stamps the message with a sequence number and registers it in `self.pending`. A background `retry_loop` thread calls `reliability.retry()` every second; any pending message older than 2 seconds is retransmitted. When a peer receives the PUT, it replies with an ACK and the sequence number is cleared from `pending`.
+
+Independently, `gossip_loop()` wakes up every 3 seconds and broadcasts the entire store to all peers as a `GOSSIP` message. This acts as a self-healing anti-entropy repair mechanism — even if every direct PUT was dropped, the gossip cycle will propagate the data.
+
+<Warning>
+  Aether Sync stores state **in memory only**. If a node process is killed, its local state is lost. Reconnecting the node and waiting for one gossip cycle will restore state from surviving peers, but unsent writes that never reached any peer will be permanently lost.
+</Warning>
+
+## Next Steps
+
+Now that your cluster is running, explore how the four layers work together:
+
+<Card
+  title="Architecture Overview"
+  icon="layer-group"
+  href="/architecture/overview"
+>
+  Understand the Transport, Reliability, Gossip, and Store layers in depth — including message formats, convergence proofs, and known limitations.
+</Card>

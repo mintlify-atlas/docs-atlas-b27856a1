@@ -1,0 +1,162 @@
+---
+title: "Aether Sync Message Protocol Reference"
+sidebarTitle: "Messages"
+description: "Reference for Aether Sync's three UDP message types — PUT, GOSSIP, and ACK — covering field definitions, JSON wire format, and delivery semantics."
+---
+
+Aether Sync nodes communicate exclusively through JSON-serialized dictionaries transmitted over raw UDP sockets. Every message is encoded with `json.dumps`, sent via `socket.sendto`, and decoded with `json.loads` on receipt — no framing, no length prefix, no persistent connection. The maximum packet size is bounded by `BUFFER_SIZE` (default 4 096 bytes). Three message types drive the entire synchronization lifecycle: `PUT` propagates new writes, `GOSSIP` performs periodic full-state anti-entropy, and `ACK` confirms reliable delivery.
+
+## Overview
+
+All wire messages share a common envelope: a flat JSON object with a `"type"` discriminator field. Higher layers — the reliability layer and the gossip layer — add their own fields on top of that envelope. The transport layer itself is stateless; it sends and receives raw bytes without inspecting content beyond what is needed to route the message to the correct handler in the listener thread.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  APPLICATION LAYER  (Multi-master read/write semantics) │
+├─────────────────────────────────────────────────────────┤
+│  GOSSIP LAYER       (Anti-entropy, periodic state sync) │
+├─────────────────────────────────────────────────────────┤
+│  RELIABILITY LAYER  (Seq numbers, ACK handling, retry)  │
+├─────────────────────────────────────────────────────────┤
+│  TRANSPORT LAYER    (UDP sockets, loss simulation)      │
+└─────────────────────────────────────────────────────────┘
+```
+
+Messages travel upward through this stack on receipt and downward on send. The three message types each enter and exit at different layers, as described in the sections below.
+
+---
+
+## PUT Message
+
+A `PUT` message announces a single key-value write to every known peer. It is generated inside the user loop of `node.py` whenever the operator (or embedding application) inserts a new value, and is handed to `Reliability.reliable_send()` for sequenced, ACK-tracked delivery.
+
+```json
+{
+  "type": "PUT",
+  "from": "node-1",
+  "key": "user:42:name",
+  "value": "Alice",
+  "ts": 1678156800.234,
+  "seq": 42
+}
+```
+
+<ResponseField name="type" type="string" required>
+  Always `"PUT"`. Identifies this message to the listener's dispatch switch so it is routed to the store merge path.
+</ResponseField>
+
+<ResponseField name="from" type="string" required>
+  The node ID of the sender (e.g. `"node-1"`). Used as the tie-breaking node identifier when the store's LWW conflict-resolution logic encounters two records with identical timestamps.
+</ResponseField>
+
+<ResponseField name="key" type="string" required>
+  The store key being written. Keys are arbitrary strings; the recommended convention is a colon-delimited namespace such as `"service:resource:field"` (e.g. `"user:42:name"`).
+</ResponseField>
+
+<ResponseField name="value" type="string" required>
+  The value to store, always serialized as a JSON string. To store structured data, JSON-encode the object before insertion and decode it after retrieval.
+</ResponseField>
+
+<ResponseField name="ts" type="float" required>
+  Unix timestamp (seconds since epoch, with sub-second precision) captured at the moment of the local write via `time.time()`. The LWW store uses this as the primary ordering key: a higher timestamp always wins, with `from` (node ID) used as the lexicographic tiebreaker.
+</ResponseField>
+
+<ResponseField name="seq" type="integer" required>
+  Monotonically increasing sequence number assigned by `Reliability.reliable_send()`. The sender retains the message in `pending` until an `ACK` carrying this exact `seq` value is received. The sequence counter is per-node and per-process — it resets on restart.
+</ResponseField>
+
+**Semantics:** A PUT is broadcast individually to every peer in the `peers` list. Each peer merges the record into its local LWW store and immediately replies with an ACK sent back to the originating address. The originator removes the message from its retry queue upon receiving that ACK.
+
+---
+
+## GOSSIP Message
+
+A `GOSSIP` message carries a complete snapshot of the sender's LWW store. It is emitted by the `gossip_loop` thread in `gossip.py` every `GOSSIP_INTERVAL` seconds (default 3 s) and sent to every known peer via `Reliability.reliable_send()`, giving it its own `seq` number and retry guarantees.
+
+```json
+{
+  "type": "GOSSIP",
+  "store": {
+    "user:42:name": ["Alice", 1678156800.234, "node-1"],
+    "counter": ["100", 1678156810.890, "node-3"]
+  }
+}
+```
+
+<ResponseField name="type" type="string" required>
+  Always `"GOSSIP"`. Routes this message to the anti-entropy merge path in the listener.
+</ResponseField>
+
+<ResponseField name="store" type="object" required>
+  A JSON object whose keys are store keys and whose values are three-element JSON arrays of the form `[value, timestamp, node_id]`. On the wire these are arrays because JSON has no tuple type; the receiver's `Store.merge()` calls `tuple(incoming)` on each entry to convert them back to the internal `(value, ts, node_id)` tuple representation used by the LWW store.
+
+  Each element of the array corresponds to a store record field:
+
+  | Index | Type | Description |
+  |-------|------|-------------|
+  | `0` | string | The stored value |
+  | `1` | float | Unix timestamp of the write |
+  | `2` | string | Node ID of the originating writer |
+</ResponseField>
+
+**Semantics:** Upon receipt, the listener calls `store.merge(msg["store"])` directly — no ACK is sent for the merge itself, but the underlying transport-level ACK (triggered by the `seq` field added by the reliability layer) is still returned so the sender can clear the message from its retry queue. Because the merge is idempotent, receiving the same GOSSIP message multiple times produces no change. This makes gossip-based anti-entropy safe to combine with the retry loop without risk of data corruption or duplication.
+
+<Note>
+  The GOSSIP message carries the **full** store snapshot, not a delta. For clusters with large data sets this can approach `BUFFER_SIZE` (4 096 bytes). If your store exceeds this limit, the UDP packet will be silently truncated. Consider sharding keys across multiple logical stores or increasing `BUFFER_SIZE` in `config.py`.
+</Note>
+
+---
+
+## ACK Message
+
+An ACK message is the lightest message in the protocol. It is generated inline by the listener thread in `node.py` immediately after a `PUT` is processed, and sent back to the originating address using `transport.unreliable_send()` — meaning ACKs themselves are **not** retried and are **not** sequenced.
+
+```json
+{
+  "type": "ACK",
+  "seq": 42
+}
+```
+
+<ResponseField name="type" type="string" required>
+  Always `"ACK"`. Routes this message to `Reliability.handle_ack()` in the listener dispatch.
+</ResponseField>
+
+<ResponseField name="seq" type="integer" required>
+  The sequence number of the message being acknowledged. This value is copied verbatim from the `seq` field of the PUT or GOSSIP being confirmed. `Reliability.handle_ack()` uses it as a key to delete the corresponding entry from the `pending` dict, halting further retries.
+</ResponseField>
+
+**Semantics:** An ACK confirms that the receiver has successfully processed and merged the message identified by `seq`. Because ACKs travel over `unreliable_send()`, an ACK can itself be dropped. In that case the sender's retry loop will resend the original message after `RETRY_INTERVAL` seconds (default 2 s); the receiver will process the duplicate, find no new information in the LWW merge, and send another ACK. This cycle terminates as soon as one ACK survives the network.
+
+---
+
+## Message Flow
+
+The following steps trace the full lifecycle of a single PUT write from originator to confirmed delivery:
+
+<Steps>
+  <Step title="User issues a write">
+    The operator enters `i` at the prompt (or the embedding application calls `store.merge()` and constructs a message dict). A `PUT` message is built with the current `time.time()` timestamp and the local node ID.
+  </Step>
+  <Step title="Reliability layer assigns seq">
+    `Reliability.reliable_send()` increments its internal counter, stamps the message with `seq`, stores `(msg, addr, now)` in `pending`, and calls `transport.unreliable_send()`.
+  </Step>
+  <Step title="Transport layer sends (or drops)">
+    `Transport.unreliable_send()` rolls a random number against `LOSS_PROB`. If the roll falls below the threshold the packet is silently discarded; otherwise it is encoded and handed to the OS UDP stack.
+  </Step>
+  <Step title="Receiver processes the PUT">
+    The peer's listener thread calls `store.merge({key: (value, ts, from)})` and immediately fires an `ACK` back to the sender's address via `transport.unreliable_send()`.
+  </Step>
+  <Step title="Retry on timeout">
+    The sender's `retry_loop` thread wakes every second and scans `pending`. Any entry whose timestamp is more than `RETRY_INTERVAL` seconds old is re-sent and its timestamp is refreshed. Steps 3–4 repeat until an ACK is received.
+  </Step>
+  <Step title="ACK received — pending entry removed">
+    The sender's listener receives the `ACK`, calls `Reliability.handle_ack(seq)`, and deletes the entry from `pending`. No further retries occur for this sequence number.
+  </Step>
+</Steps>
+
+---
+
+<Note>
+  All Aether Sync messages are transmitted as **plaintext JSON with no encryption, no HMAC signature, and no peer authentication**. Any process that can send UDP packets to a node's port can inject arbitrary keys and values into the store. Aether Sync is designed for trusted internal networks (e.g., a private LAN or an encrypted overlay like WireGuard). Do not expose node ports to untrusted networks without adding an authentication and encryption layer.
+</Note>

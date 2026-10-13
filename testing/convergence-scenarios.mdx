@@ -1,0 +1,149 @@
+---
+title: "Testing Convergence and Conflict Resolution"
+sidebarTitle: "Convergence Scenarios"
+description: "Verify Aether Sync's eventual consistency guarantees and LWW conflict resolution by running concurrent writes and inspecting per-node state."
+---
+
+Eventual consistency is a correctness property, not just a performance characteristic — either all nodes converge to the same value or the system is broken. This page walks through the structured test scenarios that verify Aether Sync's convergence guarantees, explains how to read the per-node state output to confirm agreement, and documents how the system behaves when physical clocks are skewed between nodes.
+
+## Scenario 2: Conflict Resolution Test
+
+The conflict resolution scenario deliberately creates a write conflict — two nodes write different values to the same key at roughly the same time — and then verifies that both nodes converge to exactly the same winner. This exercises the Last-Write-Wins (LWW) merge logic in `store.py`:
+
+```python
+# store.py — LWW merge logic
+def merge(self, remote):
+    with self.lock:
+        for k, incoming in remote.items():
+            if k not in self.data:
+                self.data[k] = tuple(incoming)
+            else:
+                v, ts, n = self.data[k]
+                iv, its, inode = incoming
+                if its > ts or (its == ts and inode > n):
+                    self.data[k] = tuple(incoming)
+```
+
+The winner is determined by two rules applied in order: the record with the strictly later `timestamp` wins; if timestamps are equal, the record whose `node_id` is lexicographically larger wins. This resolution is deterministic, commutative, and idempotent — applying the same merge any number of times from any order produces the same result.
+
+**Setup:** Two terminal sessions running `python node.py`, one on port 5001 (`node-1`) and one on port 5002 (`node-2`). Each node must add the other as a peer before the test begins.
+
+<Steps>
+  <Step title="Start node-1 and node-2">
+    **Terminal 1:**
+    ```bash
+    python node.py
+    # Node ID: node-1
+    # Port: 5001
+    ```
+    Use `[p]` to add peer `127.0.0.1:5002`.
+
+    **Terminal 2:**
+    ```bash
+    python node.py
+    # Node ID: node-2
+    # Port: 5002
+    ```
+    Use `[p]` to add peer `127.0.0.1:5001`.
+  </Step>
+
+  <Step title="Write conflicting values concurrently">
+    As quickly as possible — ideally within the same second — perform both writes:
+
+    **On node-1**, use `[i]` to insert:
+    ```
+    key: counter
+    value: 10
+    ```
+
+    **On node-2**, use `[i]` to insert immediately after:
+    ```
+    key: counter
+    value: 20
+    ```
+
+    Each write is stamped with `time.time()` at the moment of insertion. The later of the two timestamps will determine the winner. If both writes fall within the same floating-point second (unlikely but possible in testing), the node with the lexicographically larger node ID (`node-2 > node-1`) wins.
+  </Step>
+
+  <Step title="Wait for gossip convergence">
+    Wait at least **6 seconds** — two full `GOSSIP_INTERVAL` cycles at the default setting of 3 seconds. Both nodes are broadcasting their full store to each other every 3 seconds. After two cycles, both will have seen the other's write and applied the merge logic.
+  </Step>
+
+  <Step title="Inspect state on both nodes">
+    On **both** node-1 and node-2, enter `[s]` to print the current store:
+
+    ```python
+    # Example output if node-2's write was later (T2 > T1):
+    {'counter': ('20', 1678156810.234, 'node-2')}
+
+    # Example output if node-1's write was later (T1 > T2):
+    {'counter': ('10', 1678156805.567, 'node-1')}
+    ```
+
+    The exact winner depends on the physical clock at write time. What matters for correctness is that **both nodes show the identical tuple** — same value, same timestamp, same node ID.
+  </Step>
+
+  <Step title="Verify agreement">
+    Compare the `[s]` output between both terminals. The three-element tuples must be byte-for-byte identical. If they differ, the merge has not yet completed — wait another gossip cycle and re-check.
+  </Step>
+</Steps>
+
+**Expected result:** Both nodes converge to the value with the later timestamp. The loser's write is silently superseded during gossip merge. No manual intervention or conflict notification is produced.
+
+## Expected Convergence Timing
+
+The time to reach full cluster agreement depends primarily on `GOSSIP_INTERVAL` and the prevailing packet loss rate. Under the default configuration (`GOSSIP_INTERVAL = 3`, `LOSS_PROB = 0.3`), the following ranges apply:
+
+| Condition | Convergence Time | Notes |
+|-----------|-----------------|-------|
+| 30% packet loss (default) | 6–9 seconds | 2–3 gossip cycles required for reliable delivery |
+| 0% packet loss (`LOSS_PROB = 0.0`) | 3–6 seconds | 1–2 gossip cycles; first PUT broadcast often sufficient |
+| 60% packet loss | 9–15 seconds | 3–5 gossip cycles; retry loop becomes the primary delivery mechanism |
+| `tc netem loss 30%` on loopback | 6–12 seconds | Kernel-level drops stack with `LOSS_PROB`; combined effective loss is higher |
+
+<Info>
+  `GOSSIP_INTERVAL` is the single most impactful tuning knob for convergence speed. Halving it from 3 seconds to 1.5 seconds cuts the worst-case convergence window roughly in half. However, it also doubles the steady-state network overhead: each gossip cycle broadcasts the full store (~3 KB per cycle), so aggressive intervals can saturate low-bandwidth links. See [Performance Characteristics](/operations/performance) for the full trade-off analysis.
+</Info>
+
+## How to Verify Convergence
+
+The `[s]` command on each node prints the contents of the in-memory `Store` as a Python dictionary. Each entry is a three-tuple `(value, timestamp, node_id)`:
+
+```python
+# Run [s] on node-1
+{'username': ('alice', 1678156800.234, 'node-1'),
+ 'email':    ('alice@example.com', 1678156805.567, 'node-1'),
+ 'counter':  ('20', 1678156810.890, 'node-2')}
+
+# Run [s] on node-2 — must be identical
+{'username': ('alice', 1678156800.234, 'node-1'),
+ 'email':    ('alice@example.com', 1678156805.567, 'node-1'),
+ 'counter':  ('20', 1678156810.890, 'node-2')}
+```
+
+To confirm convergence programmatically, compare the full dictionaries across nodes. Every key must have the same `(value, timestamp, node_id)` tuple on every node. A mismatch on the timestamp or node ID — even if the values look the same — indicates incomplete merge propagation.
+
+For a three-node cluster, the checklist is:
+
+- Run `[s]` on node-1, node-2, and node-3 within the same few seconds
+- Copy the output for each node
+- Confirm all three dictionaries are identical in key count, key names, values, timestamps, and originating node IDs
+- If any node is missing keys present on others, wait one more gossip cycle and repeat
+
+## Clock Skew Behavior
+
+Aether Sync uses `time.time()` (physical wall-clock time) to stamp each write at the moment it is submitted via the `[i]` command. This means the system assumes nodes have loosely synchronized clocks — a reasonable assumption when NTP is running, but a potential issue in environments with large clock drift.
+
+**What happens with moderate clock skew (seconds to a few minutes):**
+
+If node-1's clock is running 10 seconds ahead of node-2's clock, writes from node-1 will always appear to have a later timestamp than contemporaneous writes from node-2. This biases conflict resolution in favor of node-1: in any tie, node-1's value wins regardless of which write was logically "last." This is a known limitation of physical-clock LWW semantics.
+
+**What happens with extreme clock skew:**
+
+If a node's clock jumps backward (e.g., after an NTP correction), its new writes will have timestamps earlier than its own previous writes. The LWW merge logic will reject these writes as stale, effectively making the node's new writes invisible until its clock advances past the previous high-water mark. No data corruption or split-brain occurs — the system remains consistent — but the node appears temporarily unable to win conflicts.
+
+**Node ID tie-breaking as a safety net:**
+
+When two writes arrive with exactly equal floating-point timestamps (possible in high-throughput tests or on coarse system clocks), the conflict resolves via the node ID string comparison. Node IDs are compared lexicographically, so `node-2 > node-1`, `node-B > node-A`, and so on. This tie-breaking rule is applied consistently on all nodes, guaranteeing deterministic convergence even without meaningful clock data.
+
+**Recommendation:** Run NTP (`ntpd` or `chronyd`) on all nodes to keep clock skew within a few hundred milliseconds. For environments where clock reliability cannot be guaranteed, the future roadmap includes Hybrid Logical Clocks (HLC), which combine physical and logical time to maintain causality even across clock adjustments.

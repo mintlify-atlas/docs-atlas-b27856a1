@@ -1,0 +1,129 @@
+---
+title: "Aether Sync: Distributed State Synchronization over UDP"
+sidebarTitle: "Introduction"
+description: "Pure-Python multi-master state sync engine using CRDTs, anti-entropy gossip, and ACK-based reliability over UDP — zero external dependencies."
+---
+
+This page introduces Aether Sync, explains the core design principles that shape every architectural decision, walks through the four-layer system model, and helps you decide whether Aether Sync fits your use case.
+
+## What is Aether Sync?
+
+Aether Sync is a **pure-Python, multi-master distributed state synchronization engine** that treats network unreliability as a first-class concern rather than an edge case. Every node can accept reads and writes simultaneously — there is no primary. Conflicts are resolved automatically and deterministically using **Conflict-free Replicated Data Types (CRDTs)**, so no coordination round-trips are needed and no write is ever rejected.
+
+Under the hood, three mechanisms work together to keep every replica converged:
+
+- **CRDTs (Last-Write-Wins element dictionary)** — each stored value carries a `(value, timestamp, node_id)` tuple. Merges are commutative, associative, and idempotent, so replaying the same update any number of times is always safe.
+- **Anti-entropy gossip** — every `GOSSIP_INTERVAL` seconds (default 3 s) each node broadcasts its full state to all known peers, automatically repairing any divergence without central coordination.
+- **ACK-based reliability over UDP** — a lightweight sequence-number and acknowledgement layer sits above raw UDP sockets, retrying unacknowledged messages every `RETRY_INTERVAL` seconds (default 2 s) until delivery is confirmed.
+
+The entire stack runs on the Python standard library (`threading`, `socket`, `json`, `random`) — there are no third-party packages to install.
+
+## Key Design Principles
+
+### CRDT Last-Write-Wins (LWW) Semantics
+
+Every entry in the store is a 3-tuple:
+
+```python
+store.data = {
+    "user:42:name":  ("Alice",             1678156800.234, "node-1"),
+    "user:42:email": ("alice@example.com", 1678156805.567, "node-2"),
+    "counter":       ("100",               1678156810.890, "node-3"),
+}
+```
+
+When two replicas hold different values for the same key, the `Store.merge()` method applies a deterministic, two-level comparison directly from `store.py`:
+
+```python
+if its > ts or (its == ts and inode > n):
+    self.data[k] = tuple(incoming)
+```
+
+1. **Newest timestamp wins** — the record with the higher physical timestamp is accepted.
+2. **Tie-breaking by node ID** — when timestamps are equal, the lexicographically larger `node_id` wins, ensuring commutative resolution across every replica even under loose clock synchronization.
+
+### Eventual Consistency and CAP Trade-offs
+
+Aether Sync sits firmly in the **AP** quadrant of the CAP theorem — it maximises **Availability** and **Partition Tolerance** at the cost of immediate consistency. Every node stays writable during a network partition. Once the partition heals, gossip cycles converge all replicas to the same state within `O(log N × GOSSIP_INTERVAL)` rounds, where *N* is the network diameter.
+
+### Chaos-First Design
+
+`transport.py` ships with a built-in packet-loss simulator controlled by `LOSS_PROB` (default `0.3`). Every send passes through `unreliable_send()`, which silently drops 30 % of packets at random:
+
+```python
+def unreliable_send(self, msg, addr):
+    if random.random() < LOSS_PROB:
+        return          # silent drop — intentional
+    self.sock.sendto(json.dumps(msg).encode(), addr)
+```
+
+Designing against this default — rather than zero-loss localhost — means the reliability and gossip layers are exercised continuously during development, not just during dedicated fault-injection tests.
+
+### Idempotency
+
+`Store.merge()` guards every key with a compare-before-update: if the incoming record is not strictly newer, the local record is left untouched. This means gossip retransmissions and duplicate UDP deliveries produce no side effects, making replay-based recovery safe by construction.
+
+## Four-Layer Architecture
+
+Aether Sync is structured as four discrete layers, each with a single responsibility:
+
+| Layer | Module | Responsibility |
+|---|---|---|
+| **Transport** | `transport.py` | Raw UDP sockets, JSON serialization, packet-loss simulation |
+| **Reliability** | `reliability.py` | Sequence numbers, ACK tracking, 2-second retry loop |
+| **Gossip** | `gossip.py` | Periodic full-state anti-entropy broadcast every `GOSSIP_INTERVAL` seconds |
+| **Store** | `store.py` | Thread-safe CRDT LWW dictionary with idempotent `merge()` |
+
+`node.py` wires all four layers together and exposes the interactive CLI. A detailed breakdown of each layer — including data flow diagrams and message-type specifications — is covered in the architecture pages.
+
+## When to Use Aether Sync
+
+Aether Sync is a good fit when:
+
+- **Availability beats strict consistency** — users need to read and write from any node at any time, and brief divergence between replicas is acceptable.
+- **Network conditions are hostile** — high packet-loss environments (IoT gateways, edge nodes, WAN links) where TCP's overhead is undesirable.
+- **Conflict resolution can be timestamp-driven** — the application domain tolerates LWW semantics (configuration flags, presence data, sensor readings, feature toggles).
+- **Zero-dependency deployment** — embedded systems, air-gapped environments, or containers where pulling external packages is restricted.
+
+Aether Sync is **not** the right choice when:
+
+- **Strong consistency is required** — financial ledgers, inventory counters, or any domain where every write must be globally serialised before acknowledgement.
+- **Delete semantics matter** — the current store has no tombstone support; deleted keys must be modelled as sentinel values.
+- **Untrusted networks** — messages are transmitted as plaintext JSON with no authentication or encryption.
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Spin up a three-node cluster on localhost in under five minutes.
+  </Card>
+  <Card
+    title="Architecture Overview"
+    icon="layer-group"
+    href="/architecture/overview"
+  >
+    Deep-dive into the Transport, Reliability, Gossip, and Store layers.
+  </Card>
+  <Card
+    title="Configuration"
+    icon="sliders"
+    href="/configuration"
+  >
+    Tune packet-loss probability, retry intervals, gossip cadence, and buffer sizes.
+  </Card>
+  <Card
+    title="Store API"
+    icon="database"
+    href="/api/store"
+  >
+    Reference documentation for `Store.merge()`, `get_all()`, and `put_local()`.
+  </Card>
+</CardGroup>
+
+<Note>
+  Aether Sync is a **reference implementation** intended for educational and research purposes. It has no persistent storage, no authentication, and no encryption. Review the [Known Limitations](/architecture/overview#known-limitations) section before deploying in any production or security-sensitive context.
+</Note>

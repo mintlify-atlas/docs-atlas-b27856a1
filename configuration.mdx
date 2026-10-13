@@ -1,0 +1,139 @@
+---
+title: "Configuring Aether Sync: Parameters and Tuning Guide"
+sidebarTitle: "Configuration"
+description: "Master all four config.py parameters — LOSS_PROB, RETRY_INTERVAL, GOSSIP_INTERVAL, and BUFFER_SIZE — and learn how each one shapes convergence speed, throughput, and fault tolerance."
+---
+
+Aether Sync is intentionally configured through a single file: `config.py`. All four parameters live there, and changing any one of them immediately affects the behaviour of every layer — from how aggressively the transport simulates packet loss, to how quickly unacknowledged messages are retried, to the maximum payload the UDP socket will accept. There is no runtime config reload; restart the node after editing the file.
+
+## config.py — full source
+
+```python
+LOSS_PROB = 0.3
+RETRY_INTERVAL = 2
+GOSSIP_INTERVAL = 3
+BUFFER_SIZE = 4096
+```
+
+## Parameter reference
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `LOSS_PROB` | `float` | `0.3` | Probability (0.0 – 1.0) that any outbound UDP packet is silently dropped by the transport layer to simulate network chaos |
+| `RETRY_INTERVAL` | `int` | `2` | Seconds the reliability layer waits before re-sending a message whose ACK has not yet arrived |
+| `GOSSIP_INTERVAL` | `int` | `3` | Seconds between full anti-entropy state broadcasts to all known peers |
+| `BUFFER_SIZE` | `int` | `4096` | Maximum UDP receive buffer size in bytes; determines the largest serialised JSON payload the socket will accept |
+
+---
+
+<ParamField path="LOSS_PROB" type="float" default="0.3">
+  Packet-drop probability injected by the transport layer before a UDP datagram is handed to the operating system. The transport evaluates `random.random() < LOSS_PROB` on every outbound send; if the condition is true the packet is discarded silently.
+
+  - **Range**: `0.0` (no simulated loss) to `1.0` (all packets dropped)
+  - **Default `0.3`** models a 30 % loss rate, which stress-tests the reliability and gossip layers without making the cluster completely unreachable
+  - Set to `0.0` for data-centre or production-like deployments where real network loss is already handled by the infrastructure
+  - Values above `0.7` will cause heavy retry storms; convergence time grows significantly
+</ParamField>
+
+<ParamField path="RETRY_INTERVAL" type="int" default="2">
+  How long (in seconds) the reliability layer waits after sending a `PUT` message before concluding the ACK was lost and re-transmitting the same sequence number.
+
+  - The retry loop wakes every **1 second** (hard-coded in `node.py`) and checks all pending messages whose last-send timestamp is older than `RETRY_INTERVAL`
+  - Lowering this value increases re-transmission aggressiveness, which helps under high loss but adds network overhead
+  - Raising this value reduces retry traffic at the cost of slower delivery confirmation
+  - At the default `LOSS_PROB = 0.3`, expect **3 – 5 retry attempts** on average before an ACK is received
+</ParamField>
+
+<ParamField path="GOSSIP_INTERVAL" type="int" default="3">
+  Period in seconds between consecutive anti-entropy gossip rounds. Each round serialises the **entire local store** and fans it out to every registered peer as a `GOSSIP` message.
+
+  - Gossip is the **convergence safety net**: even if every reliable `PUT` for a key is lost, the gossip round will eventually propagate the value
+  - Shorter intervals mean faster convergence but higher steady-state bandwidth (the full store is sent every cycle)
+  - Longer intervals reduce network overhead at the cost of a wider staleness window
+  - Convergence time under default settings is approximately `2 × GOSSIP_INTERVAL = 6 seconds`
+</ParamField>
+
+<ParamField path="BUFFER_SIZE" type="int" default="4096">
+  Size in bytes of the UDP receive buffer passed to `socket.recvfrom(BUFFER_SIZE)`. Any datagram larger than this value will be silently truncated, producing a JSON parse error.
+
+  - The default `4096` bytes comfortably holds hundreds of small key-value records in a single gossip payload
+  - If your store grows large (thousands of keys or long string values) you should increase this to `65507` (maximum UDP payload) or implement store-partitioned gossip
+  - Reducing this value below the size of a typical gossip message will cause `GOSSIP` messages to be dropped; keep it well above the average serialised store size
+</ParamField>
+
+---
+
+## Tuning guidance
+
+### Effect on convergence time
+
+Convergence time is dominated by the interplay of `GOSSIP_INTERVAL` and `RETRY_INTERVAL`:
+
+- **`GOSSIP_INTERVAL`** sets the upper-bound staleness window. A write that is never ACK-confirmed will still appear on every peer within one gossip cycle.
+- **`RETRY_INTERVAL`** controls how quickly point-to-point `PUT` messages are confirmed. Lowering it closes the delivery gap between gossip rounds.
+- Under the defaults, worst-case convergence is roughly `GOSSIP_INTERVAL + RETRY_INTERVAL = 5 seconds`; best-case (first attempt succeeds) is sub-second.
+
+### Effect on throughput
+
+- High `LOSS_PROB` + low `RETRY_INTERVAL` → many re-transmissions → high CPU and socket I/O overhead, lower effective write throughput.
+- High `GOSSIP_INTERVAL` → fewer full-store serialisations → lower steady-state CPU cost, but slower background repair.
+- `BUFFER_SIZE` only matters when gossip payloads grow large. Below that threshold it has no throughput impact.
+
+### Effect on memory
+
+- `BUFFER_SIZE` allocates a fixed byte buffer per `recvfrom` call; this is negligible.
+- The pending-ACK queue in the reliability layer grows with `(message rate) × RETRY_INTERVAL`. Lowering `RETRY_INTERVAL` prunes the queue faster.
+- There is currently no TTL on the pending queue, so a permanently unreachable peer will cause unbounded growth — reduce `RETRY_INTERVAL` and add peer health checks to mitigate this.
+
+---
+
+## Example configurations
+
+### High-loss network (unstable WAN / mobile)
+
+```python
+# config.py — High-loss WAN profile
+LOSS_PROB      = 0.5   # Simulate 50 % loss for testing; set to real loss rate in prod
+RETRY_INTERVAL = 1     # Retry aggressively to compensate for frequent drops
+GOSSIP_INTERVAL = 5    # Relax gossip to avoid flooding a congested link
+BUFFER_SIZE    = 4096
+```
+
+With `RETRY_INTERVAL = 1` the reliability layer catches dropped ACKs within one second.
+Raising `GOSSIP_INTERVAL` to `5` reduces background bandwidth on the constrained link.
+
+### Low-latency data-centre (reliable LAN)
+
+```python
+# config.py — Data-centre profile
+LOSS_PROB      = 0.0   # Disable simulation; real network is reliable
+RETRY_INTERVAL = 1     # Short retry window for fast failure detection
+GOSSIP_INTERVAL = 1    # Sub-second convergence across racks
+BUFFER_SIZE    = 16384 # Accommodate larger stores in a single gossip message
+```
+
+Setting `LOSS_PROB = 0.0` removes all artificial drops. Combined with
+`GOSSIP_INTERVAL = 1` you can expect cluster convergence in under two seconds.
+
+### Testing / development (local loopback)
+
+```python
+# config.py — Development profile
+LOSS_PROB      = 0.3   # Keep chaos simulation active to expose bugs
+RETRY_INTERVAL = 2     # Default — no need to rush on localhost
+GOSSIP_INTERVAL = 3    # Default — observe convergence at a human-readable pace
+BUFFER_SIZE    = 4096  # Default
+```
+
+The defaults are intentionally chaos-oriented so that local testing exercises the
+full reliability and gossip stack, not just the happy path.
+
+---
+
+<Warning>
+  Setting `LOSS_PROB = 0.0` **disables the packet-drop simulation entirely**. This is the correct setting for production-like performance testing or data-centre deployments, but it means your integration tests will never exercise the retry and gossip repair paths. Keep at least one test suite running with a non-zero `LOSS_PROB` (e.g. `0.1`) to ensure your application handles delayed convergence gracefully.
+</Warning>
+
+<Tip>
+  `GOSSIP_INTERVAL` and `RETRY_INTERVAL` serve complementary roles: `RETRY_INTERVAL` controls how quickly a *specific* message is re-delivered to a *specific* peer, while `GOSSIP_INTERVAL` heals the entire cluster state in bulk regardless of individual ACK outcomes. If you lower `RETRY_INTERVAL` to speed up point-to-point delivery, you can afford to *raise* `GOSSIP_INTERVAL` slightly to reduce the bandwidth cost of full-store broadcasts — the two levers trade off delivery latency against background network overhead.
+</Tip>

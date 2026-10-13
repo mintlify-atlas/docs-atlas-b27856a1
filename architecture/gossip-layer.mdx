@@ -1,0 +1,109 @@
+---
+title: "Gossip Layer: Anti-Entropy State Propagation"
+sidebarTitle: "Gossip Layer"
+description: "How Aether Sync's gossip_loop broadcasts the full store to every peer on a fixed interval, guaranteeing cluster convergence without a central coordinator."
+---
+
+Point-to-point PUT messages, backed by the Reliability layer, handle individual writes. But what about keys that were missed entirely — because a node was offline, because an ACK was lost in a chain of retries, or because a new peer joined after the original write? The Gossip layer solves this with a simple but powerful anti-entropy protocol: every `GOSSIP_INTERVAL` seconds, each node serializes its entire store and broadcasts it to every peer it knows about. Any key a peer is missing gets filled in; any key the peer has with a newer timestamp is kept. Over a handful of rounds the entire cluster converges, with no coordinator required.
+
+## The `gossip_loop` Function
+
+```python
+# Gossip thread
+
+import time
+from config import GOSSIP_INTERVAL
+
+def gossip_loop(peers, store, reliability):
+    while True:
+        time.sleep(GOSSIP_INTERVAL)
+        msg = {"type":"GOSSIP","store":store.get_all()}
+        for p in peers:
+            reliability.reliable_send(msg, p)
+```
+
+The function is intentionally minimal. It runs forever in a daemon thread and does exactly three things on each tick:
+
+1. **Sleeps** for `GOSSIP_INTERVAL` seconds (default: 3).
+2. **Snapshots the full store** by calling `store.get_all()`, which returns a shallow copy of `self.data` under the store's mutex lock.
+3. **Broadcasts to every known peer** by iterating over the `peers` list and calling `reliability.reliable_send()` for each one.
+
+That single loop is sufficient to guarantee that all nodes converge to the same state.
+
+## Full-State Broadcast
+
+Unlike peer-to-peer database protocols that send only deltas, Aether Sync gossip always sends the **entire store**. This is the simplest possible anti-entropy strategy and has two important properties:
+
+- **Self-healing** — a node that restarted and lost its state will receive a complete copy of the cluster state in the very next gossip round it participates in.
+- **No version vectors needed** — because the store's LWW merge is idempotent and commutative, a node can receive the same GOSSIP message multiple times without any ill effect.
+
+The GOSSIP message on the wire looks like this:
+
+```json
+{
+  "type": "GOSSIP",
+  "store": {
+    "user:42:name":  ["Alice",            1678156800.234, "node-1"],
+    "user:42:email": ["alice@example.com", 1678156805.567, "node-2"],
+    "counter":       ["100",              1678156810.890, "node-3"]
+  }
+}
+```
+
+Each value in `"store"` is a JSON array of three elements corresponding to the `(value, timestamp, node_id)` tuple stored internally. The receiver calls `store.merge(msg["store"])`, which walks every key in the payload and applies LWW conflict resolution.
+
+## Receiving a GOSSIP Message
+
+On the receiving node, the `listener()` thread in `node.py` dispatches incoming messages by type:
+
+```python
+elif msg["type"] == "GOSSIP":
+    store.merge(msg["store"])
+```
+
+No ACK is sent for a GOSSIP merge itself — the ACK is handled by the Reliability layer wrapping `reliable_send`, which operates at the transport level independently of the message content.
+
+## Convergence Guarantee
+
+With `N` nodes and a network diameter of `D` hops (the maximum number of gossip steps needed for an update originating on one node to reach every other node), the cluster converges within approximately `O(D × GOSSIP_INTERVAL)` seconds. In a fully-connected cluster where every node knows every other node directly (diameter = 1), convergence takes a single gossip cycle — `GOSSIP_INTERVAL` seconds at most.
+
+```text
+GOSSIP_INTERVAL = 3   # seconds between broadcasts (config.py)
+
+Fully connected (D=1):  converges in ~3 s
+Linear chain (D=N-1):   converges in ~3(N-1) s
+```
+
+In practice, with the default settings and 30% packet loss, retransmission by the Reliability layer means a missed gossip message will be retried within 2–3 seconds, so full convergence across a 3-node cluster is reliably achieved within 2–3 gossip cycles (~6–9 seconds).
+
+<Info>
+  Eventual consistency is a hard guarantee, not a best-effort goal. Because the gossip broadcast covers the full store and the merge operation is both commutative and idempotent, every node is guaranteed to converge to the same state as long as at least one node remains reachable — regardless of how many individual PUT messages were lost in transit.
+</Info>
+
+## Gossip vs. PUT Reliability
+
+Both PUT messages and GOSSIP messages travel through the Reliability layer, so both benefit from ACK-based retransmission. The key difference is their scope:
+
+| | PUT | GOSSIP |
+|---|---|---|
+| **Content** | Single key-value update | Entire store snapshot |
+| **Trigger** | User write | Fixed-interval timer |
+| **Purpose** | Low-latency propagation of a change | Anti-entropy backstop for missed updates |
+| **Idempotent?** | Yes (LWW merge) | Yes (LWW merge) |
+| **ACK'd?** | Yes, via Reliability layer | Yes, via Reliability layer |
+
+PUTs are fast-path: they propagate a change to all peers immediately when the user writes it. Gossip is the slow-path backstop: it ensures that any key a peer missed — due to packet loss, node restart, or late joining — will be recovered within a bounded number of gossip cycles.
+
+## Configuration
+
+`GOSSIP_INTERVAL` is the only tunable parameter for the Gossip layer, defined in `config.py`:
+
+```python
+GOSSIP_INTERVAL = 3   # seconds between full anti-entropy broadcasts
+```
+
+Lowering this value reduces the time-to-convergence but increases network overhead — each gossip cycle sends `(number_of_peers × store_size)` bytes. With the default `BUFFER_SIZE` of 4 096 bytes, a single gossip message can carry roughly 80–120 small key-value entries before the UDP datagram exceeds the receive buffer.
+
+<Info>
+  The gossip thread is started as a daemon thread in `node.py`, so it stops automatically when the main thread exits. No explicit shutdown signal is required.
+</Info>

@@ -1,0 +1,293 @@
+---
+title: "Node CLI: Interactive Multi-Master Node Reference"
+sidebarTitle: "Node CLI"
+description: "node.py entry point for Aether Sync — covers startup prompts, interactive commands, thread architecture, and programmatic embedding in Python apps."
+---
+
+`node.py` is the entry point for an Aether Sync cluster participant. When run directly, it prompts for a **Node ID** and a **port**, then brings up four concurrent execution contexts: a listener thread that processes incoming UDP messages, a retry thread that resends unacknowledged messages, a gossip thread that periodically broadcasts full state to all peers, and the main thread which drives an interactive command loop for adding peers, inserting key-value data, and inspecting the local store. Because every Aether Sync node is a full peer — there is no leader or coordinator — you can run as many instances as you like and interconnect them in any topology.
+
+## Source
+
+```python
+import threading, time
+from transport import Transport
+from reliability import Reliability
+from store import Store
+from gossip import gossip_loop
+from config import RETRY_INTERVAL
+
+NODE_ID = input("Node ID: ")
+PORT = int(input("Port: "))
+
+peers = []
+
+transport = Transport(PORT)
+reliability = Reliability(transport)
+store = Store()
+
+# ---------------- LISTENER ----------------
+
+def listener():
+    while True:
+        msg, addr = transport.recv()
+
+        if msg["type"] == "PUT":
+            store.merge({
+                msg["key"]:(msg["value"],msg["ts"],msg["from"])
+            })
+            ack = {"type":"ACK","seq":msg["seq"]}
+            transport.unreliable_send(ack, addr)
+
+        elif msg["type"] == "GOSSIP":
+            store.merge(msg["store"])
+
+        elif msg["type"] == "ACK":
+            reliability.handle_ack(msg["seq"])
+
+# ---------------- RETRY ----------------
+
+def retry_loop():
+    while True:
+        time.sleep(1)
+        reliability.retry()
+
+# ---------------- USER ----------------
+
+def user_loop():
+    while True:
+        cmd = input("[p]peer [i]put [s]show : ")
+
+        if cmd == "p":
+            ip = input("IP: ")
+            port = int(input("Port: "))
+            peers.append((ip,port))
+
+        elif cmd == "i":
+            k = input("key: ").strip()
+            if k == "":
+                print("Key cannot be empty")
+                continue
+
+            v = input("value: ").strip()
+            ts = time.time()
+
+            store.merge({k:(v,ts,NODE_ID)})
+
+            msg = {
+                "type":"PUT",
+                "from":NODE_ID,
+                "key":k,
+                "value":v,
+                "ts":ts
+            }
+
+            for p in peers:
+                reliability.reliable_send(msg,p)
+
+        elif cmd == "s":
+            print(store.get_all())
+
+# ---------------- START ----------------
+
+threading.Thread(target=listener,daemon=True).start()
+threading.Thread(target=retry_loop,daemon=True).start()
+threading.Thread(
+    target=gossip_loop,
+    args=(peers,store,reliability),
+    daemon=True
+).start()
+
+user_loop()
+```
+
+---
+
+## Startup
+
+When `node.py` is executed, Python runs the module-level `input()` calls **before** any threads start. The node is not yet listening on the network during this phase.
+
+```bash
+$ python node.py
+Node ID: node-1
+Port: 5001
+[p]peer [i]put [s]show :
+```
+
+<ParamField body="Node ID" type="str">
+  A human-readable identifier for this node (e.g. `"node-1"`, `"worker-west"`). The Node ID is embedded in every PUT message as the `"from"` field and is used by `Store.merge` as a tie-breaker when two records share the same timestamp. Choose a unique, lexicographically meaningful ID — `"node-2"` beats `"node-1"` in a tie.
+</ParamField>
+
+<ParamField body="Port" type="int">
+  The UDP port this node will bind to (e.g. `5001`). Passed directly to `Transport(PORT)`. Must be free and in the range `1024–65535`. All peers that want to reach this node must specify this port when adding it via the `p` command.
+</ParamField>
+
+---
+
+## Command Reference
+
+Once startup is complete, `node.py` enters `user_loop()` and presents an interactive prompt. The following commands are available:
+
+| Command | Description | Interaction |
+|---------|-------------|-------------|
+| `p` | **Add peer** — registers a remote node so that PUT messages and gossip are sent to it | Prompts for **IP** (string) and **Port** (int); appends `(ip, port)` to the global `peers` list |
+| `i` | **Insert / update key-value** — writes a key locally and broadcasts it to all peers via reliable send | Prompts for **key** (non-empty string) and **value** (string); records the current `time.time()` as the timestamp |
+| `s` | **Show current state** — prints the full contents of the local store | Calls `store.get_all()` and prints the resulting dict; no prompts |
+
+<Note>
+  The `i` command writes the record to the **local store first** (via `store.merge`) before broadcasting the PUT message to peers. This means `s` will immediately reflect the new value on the local node even if all peers are temporarily unreachable.
+</Note>
+
+<Note>
+  Keys entered for `i` are validated: if the stripped key is an empty string, `node.py` prints `"Key cannot be empty"` and re-prompts without writing to the store or broadcasting.
+</Note>
+
+---
+
+## Thread Architecture
+
+`node.py` starts three daemon threads before handing control to `user_loop` on the main thread:
+
+```
+┌─────────────────────────────────┐
+│  Main thread: user_loop()       │
+│  Reads commands from stdin      │
+│  Calls store.merge / reliable_  │
+│  send / store.get_all           │
+└──────────┬──────────────────────┘
+           │ shares: store, reliability, peers, transport
+    ┌──────┴────────────────────────────────────────┐
+    │                                               │
+    ▼                                               │
+┌─────────────────────┐   ┌────────────────────┐   │
+│  listener thread    │   │  retry_loop thread  │   │
+│  (daemon)           │   │  (daemon)           │   │
+│  Calls transport.   │   │  Sleeps 1 second,   │   │
+│  recv() in a loop;  │   │  calls reliability. │   │
+│  dispatches PUT /   │   │  retry() each tick  │   │
+│  GOSSIP / ACK msgs  │   └────────────────────┘   │
+└─────────────────────┘                             │
+                                                    ▼
+                                     ┌──────────────────────┐
+                                     │  gossip thread       │
+                                     │  (daemon)            │
+                                     │  Sleeps GOSSIP_      │
+                                     │  INTERVAL seconds,   │
+                                     │  broadcasts full     │
+                                     │  store to all peers  │
+                                     └──────────────────────┘
+```
+
+All four contexts share the same `transport`, `reliability`, `store`, and `peers` objects. Thread safety is enforced by `Store`'s internal `threading.Lock`. Because all three background threads are `daemon=True`, they are automatically terminated when `user_loop` returns (e.g. on `KeyboardInterrupt` or EOF on stdin).
+
+---
+
+## Multi-Node Cluster Setup
+
+To run a three-node local cluster, open three terminals and start a node in each:
+
+**Terminal 1**
+```bash
+$ python node.py
+Node ID: node-1
+Port: 5001
+[p]peer [i]put [s]show : p
+IP: 127.0.0.1
+Port: 5002
+[p]peer [i]put [s]show :
+```
+
+**Terminal 2**
+```bash
+$ python node.py
+Node ID: node-2
+Port: 5002
+[p]peer [i]put [s]show : p
+IP: 127.0.0.1
+Port: 5001
+[p]peer [i]put [s]show :
+```
+
+**Terminal 3**
+```bash
+$ python node.py
+Node ID: node-3
+Port: 5003
+[p]peer [i]put [s]show : p
+IP: 127.0.0.1
+Port: 5001
+[p]peer [i]put [s]show : p
+IP: 127.0.0.1
+Port: 5002
+[p]peer [i]put [s]show :
+```
+
+After interconnecting the nodes, insert a key on any node and wait one `GOSSIP_INTERVAL` (3 seconds) for the value to propagate to all peers.
+
+---
+
+## Embedding in Python Applications
+
+Instead of running `node.py` interactively you can import and compose its components directly in your own code. The README integration guide shows the pattern:
+
+```python
+import threading, time
+from transport import Transport
+from reliability import Reliability
+from store import Store
+from gossip import gossip_loop
+
+# Configure the node
+node_id = "my-service-1"
+port = 5001
+peers = []
+
+# Construct components
+transport = Transport(port)
+reliability = Reliability(transport)
+store = Store()
+
+# Add peers programmatically
+peers.append(("192.168.1.2", 5001))
+peers.append(("192.168.1.3", 5001))
+
+# Start background threads
+def listener():
+    while True:
+        msg, addr = transport.recv()
+        if msg["type"] == "PUT":
+            store.merge({msg["key"]: (msg["value"], msg["ts"], msg["from"])})
+            transport.unreliable_send({"type": "ACK", "seq": msg["seq"]}, addr)
+        elif msg["type"] == "GOSSIP":
+            store.merge(msg["store"])
+        elif msg["type"] == "ACK":
+            reliability.handle_ack(msg["seq"])
+
+def retry_loop():
+    while True:
+        time.sleep(1)
+        reliability.retry()
+
+threading.Thread(target=listener, daemon=True).start()
+threading.Thread(target=retry_loop, daemon=True).start()
+threading.Thread(target=gossip_loop, args=(peers, store, reliability), daemon=True).start()
+
+# Write data
+ts = time.time()
+store.merge({"config:db_host": ("postgres.internal", ts, node_id)})
+msg = {"type": "PUT", "from": node_id, "key": "config:db_host",
+       "value": "postgres.internal", "ts": ts}
+for p in peers:
+    reliability.reliable_send(msg, p)
+
+# Read data
+config = store.get_all()
+print(config["config:db_host"])  # ('postgres.internal', <ts>, 'my-service-1')
+```
+
+<Tip>
+  When embedding, keep the `peers` list as a module-level or instance-level variable that you append to at runtime. Both the gossip thread and the user PUT loop read `peers` on every iteration, so new peers are picked up automatically without restarting any threads.
+</Tip>
+
+<Warning>
+  `node.py` uses module-level `input()` calls at import time (`NODE_ID = input(...)`, `PORT = int(input(...))`). If you import `node` directly into another script, those `input()` calls will execute immediately and block your program. Always construct `Transport`, `Reliability`, `Store`, and `gossip_loop` independently as shown above instead of importing from `node`.
+</Warning>

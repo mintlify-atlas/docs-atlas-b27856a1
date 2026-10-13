@@ -1,0 +1,183 @@
+---
+title: "Aether Sync: Known Limitations and Future Roadmap"
+sidebarTitle: "Limitations"
+description: "Understand Aether Sync's known constraints as a reference implementation and the planned improvements that would make it production-ready."
+---
+
+Aether Sync is a reference implementation built to demonstrate the interplay between CRDTs, ACK-based reliable delivery over UDP, and anti-entropy gossip protocols. Its source code is intentionally compact and dependency-free — pure Python, four modules, no external libraries. That simplicity comes with real constraints. This page catalogs every known limitation in detail, explains the risk or impact of each, provides the best available workaround for the current implementation, and outlines the roadmap for addressing each issue in future versions.
+
+<Note>
+  Aether Sync is designed as an educational and research reference, not a production system. The limitations below are not bugs — they are deliberate simplifications that make the core distributed systems concepts easier to study. Before deploying in any production environment, the items marked as risks below must be addressed.
+</Note>
+
+## Known Limitations
+
+<Accordion title="1. No Tombstone Support for Deletes">
+  **What it means:** The `Store` class supports `merge` and `put_local` operations, but there is no `delete` operation. Once a key is written to the store, it cannot be removed. Sending a gossip message that omits a key does not cause that key to be deleted from a peer — the CRDT merge logic only adds or updates entries, never removes them.
+
+  ```python
+  # store.py — merge only adds or updates, never deletes
+  def merge(self, remote):
+      with self.lock:
+          for k, incoming in remote.items():
+              if k not in self.data:
+                  self.data[k] = tuple(incoming)
+              else:
+                  v, ts, n = self.data[k]
+                  iv, its, inode = incoming
+                  if its > ts or (its == ts and inode > n):
+                      self.data[k] = tuple(incoming)
+  ```
+
+  **Risk:** Applications that need to remove entries — user accounts, configuration keys, expired sessions — cannot do so. Stale data accumulates indefinitely.
+
+  **Workaround:** Use a sentinel value convention. Instead of deleting a key, write a special marker value such as `"__DELETED__"` with the current timestamp. Application code must filter out sentinel values when reading:
+
+  ```python
+  # Write a logical delete
+  store.merge({"user:42": ("__DELETED__", time.time(), node_id)})
+
+  # Read with sentinel filtering
+  active_keys = {k: v for k, v in store.get_all().items() if v[0] != "__DELETED__"}
+  ```
+
+  **Future fix:** Implement a proper CRDT tombstone mechanism. Each key would carry a `deleted` flag alongside its value, and merges would propagate deletions using the same LWW rules as updates.
+</Accordion>
+
+<Accordion title="2. No Authentication or Encryption">
+  **What it means:** All messages — PUT, GOSSIP, and ACK — are transmitted as plaintext JSON over UDP. There is no peer identity verification, no message signing, and no transport encryption.
+
+  ```json
+  {
+    "type": "PUT",
+    "from": "node-1",
+    "key": "user:42:name",
+    "value": "Alice",
+    "ts": 1678156800.234,
+    "seq": 42
+  }
+  ```
+
+  Any process on the network that knows the UDP port can inject arbitrary writes, spoof gossip messages, or replay old ACKs to discard pending retransmissions.
+
+  **Risk:** On any untrusted network — including multi-tenant cloud VPCs without security groups — Aether Sync can be trivially compromised. A malicious actor could overwrite arbitrary keys with crafted timestamps, flood the cluster with spurious gossip, or disrupt convergence by sending fake ACKs.
+
+  **Workaround:** Restrict Aether Sync nodes to a trusted private network segment (e.g., a VPC with strict security group rules permitting only known node IPs). Never expose the UDP port to the public internet.
+
+  **Future fix:** Add HMAC-SHA256 message signatures using a shared cluster secret. Wrap the UDP socket with an optional TLS layer (DTLS) for full transport encryption.
+</Accordion>
+
+<Accordion title="3. In-Memory Only Storage">
+  **What it means:** The entire key-value store lives in `Store.data`, a Python dictionary held in process memory. There is no write-ahead log, no on-disk journal, and no checkpoint mechanism. When a node process exits — gracefully or otherwise — all its state is lost.
+
+  On restart, the node begins with an empty store and must wait for peers to gossip their state before recovering. This means the restart recovery time is bounded by `GOSSIP_INTERVAL` rather than a local disk read.
+
+  **Risk:** A cluster-wide simultaneous restart (e.g., a machine reboot or a power loss affecting all nodes) results in complete data loss. Individual node restarts cause a brief availability gap while the node re-syncs from peers.
+
+  **Workaround:** Export state to a JSON file before shutdown and reload it on startup:
+
+  ```python
+  import json
+
+  # Before shutdown — export state
+  snapshot = store.get_all()
+  with open("state_backup.json", "w") as f:
+      json.dump(snapshot, f)
+
+  # On startup — restore from snapshot
+  with open("state_backup.json", "r") as f:
+      restored = json.load(f)
+      store.merge(restored)
+  ```
+
+  **Future fix:** Add a pluggable storage backend. SQLite is the simplest option (single-file, zero configuration); RocksDB provides higher write throughput for large datasets.
+</Accordion>
+
+<Accordion title="4. Naive Retry Strategy">
+  **What it means:** The reliability layer retransmits unacknowledged messages on a fixed `RETRY_INTERVAL` of 2 seconds with no backoff, no jitter, and no maximum retry count:
+
+  ```python
+  # config.py
+  RETRY_INTERVAL = 2    # Fixed 2-second retry interval — no exponential backoff
+  ```
+
+  Under high packet loss, all retrying nodes fire retransmissions at the same fixed cadence. This creates synchronized retry storms: every 2 seconds, every node floods the network with all its pending messages simultaneously, which can temporarily worsen congestion and cause further packet loss.
+
+  **Risk:** Under extreme network stress (>50% loss or very large clusters), the naive retry strategy can become self-defeating — retransmissions cause the congestion that causes more retransmissions.
+
+  **Workaround:** Reduce `LOSS_PROB` and limit cluster size to avoid triggering the feedback loop. For moderate loss rates (30%), the gossip layer compensates adequately.
+
+  **Future fix:** Implement exponential backoff with jitter. The first retry fires after 2 seconds; subsequent retries double the interval (4s, 8s, 16s) up to a configurable maximum, with random jitter added to desynchronize retry storms.
+</Accordion>
+
+<Accordion title="5. No Garbage Collection for Pending Messages">
+  **What it means:** The reliability layer stores every outbound message in a `pending` dictionary until an ACK is received. If a peer disappears — crashed, network partitioned, or simply removed from the cluster — its unacknowledged messages remain in `pending` indefinitely. The retry loop will continue retransmitting them forever.
+
+  **Risk:** This is a genuine memory leak. In a long-running cluster with any peer churn, the `pending` dictionary grows without bound. A node that has been retrying messages to a dead peer for hours may consume gigabytes of heap memory and flood the network with useless retransmissions.
+
+  **Workaround:** Monitor process RSS (Resident Set Size) over time. If it grows steadily, the likely cause is accumulated pending messages. Restart the affected node and remove the dead peer from the peers list before restarting.
+
+  **Future fix:** Add a configurable TTL (time-to-live) for pending messages. Messages older than the TTL are dropped from the queue regardless of ACK status. A dead peer detection mechanism (e.g., no gossip received in N intervals) should also trigger automatic peer removal.
+</Accordion>
+
+<Accordion title="6. Loose Time Synchronization Assumption">
+  **What it means:** Conflict resolution in the LWW store is based entirely on `time.time()` — the local physical wall clock at the moment of each write. The correctness of conflict resolution depends on clocks being approximately synchronized across all nodes.
+
+  ```python
+  # node.py — timestamp assigned at write time using local clock
+  ts = time.time()
+  store.merge({k: (v, ts, NODE_ID)})
+  ```
+
+  If node-A's clock is 5 minutes ahead of node-B's clock, every write from node-A will appear to be 5 minutes more recent than a contemporaneous write from node-B. Node-B will never win a conflict, regardless of which write was logically last.
+
+  If a clock jumps backward (e.g., after an NTP step correction), new writes from that node will have timestamps earlier than its own previous writes, making them invisible to the merge logic until the clock catches up.
+
+  **Risk:** Severe clock skew produces silent data loss — the "losing" write is silently discarded with no error or warning.
+
+  **Workaround:** Run NTP (`ntpd` or `chronyd`) on all nodes to keep clock skew within a few hundred milliseconds. The node ID tie-breaking rule (`inode > n`) provides a deterministic fallback for exact timestamp ties but does not help with systematic clock drift.
+
+  **Future fix:** Implement Hybrid Logical Clocks (HLC). HLCs combine physical time with a logical counter to provide causality tracking that is resilient to moderate clock skew without requiring tight NTP synchronization.
+</Accordion>
+
+<Accordion title="7. Single-Threaded Listener">
+  **What it means:** The `listener` function in `node.py` runs in a single daemon thread and processes one message at a time in a blocking loop:
+
+  ```python
+  # node.py — single-threaded blocking listener
+  def listener():
+      while True:
+          msg, addr = transport.recv()   # Blocking call
+          if msg["type"] == "PUT":
+              store.merge({msg["key"]: (msg["value"], msg["ts"], msg["from"])})
+              ack = {"type": "ACK", "seq": msg["seq"]}
+              transport.unreliable_send(ack, addr)
+          elif msg["type"] == "GOSSIP":
+              store.merge(msg["store"])
+          elif msg["type"] == "ACK":
+              reliability.handle_ack(msg["seq"])
+  ```
+
+  All message parsing, store merging, and ACK dispatch happen sequentially on a single CPU core. A slow merge (e.g., merging a large gossip payload) blocks all subsequent message processing, including time-sensitive ACKs.
+
+  **Risk:** Under high message rates or with large gossip payloads, the listener thread becomes a throughput bottleneck. ACK latency increases, triggering unnecessary retransmissions. The system degrades gracefully but cannot scale beyond the capacity of a single thread.
+
+  **Workaround:** Keep store size small and limit cluster size to avoid overwhelming the single-threaded listener with concurrent gossip floods.
+
+  **Future fix:** Migrate to `asyncio` with a non-blocking event loop. ACK handling and store merges can be dispatched to a thread pool executor, allowing concurrent processing across multiple CPU cores.
+</Accordion>
+
+## Future Roadmap
+
+The following improvements are planned for future versions of Aether Sync. Items are listed in rough priority order, from lowest to highest architectural complexity:
+
+- [ ] **Exponential backoff with jitter** — replace the fixed `RETRY_INTERVAL` with binary exponential backoff to eliminate retry storms under high-loss conditions
+- [ ] **Pending message TTL and dead peer detection** — bound the memory usage of the reliability layer and automatically remove unreachable peers
+- [ ] **Tombstone support for deletes** — add CRDT-compatible delete semantics so keys can be permanently removed from the cluster
+- [ ] **TLS / DTLS transport encryption** — wrap UDP sockets with DTLS and add HMAC-SHA256 message authentication for untrusted network deployments
+- [ ] **Hybrid Logical Clocks (HLC)** — replace `time.time()` with HLC timestamps to maintain causality under clock skew without requiring tight NTP synchronization
+- [ ] **Vector clocks for happens-before causality** — augment the LWW model with vector clock metadata to detect true concurrency and allow richer application-level conflict resolution
+- [ ] **Prometheus metrics exporter** — expose gossip cycle counts, pending queue depth, ACK latency, and store size as Prometheus-compatible metrics for operational observability
+- [ ] **`asyncio` migration** — rewrite the listener and gossip loop using `asyncio` and `asyncio.DatagramProtocol` to support concurrent message processing and eliminate the single-threaded bottleneck
+- [ ] **Pluggable storage backend** — add SQLite and RocksDB backends so store state survives node restarts without requiring manual JSON snapshot exports
+- [ ] **Delta gossip** — replace full-state broadcast with epoch-based delta sync to reduce network overhead from O(store size) to O(changes since last epoch)

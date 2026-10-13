@@ -1,0 +1,112 @@
+---
+title: "Gossip Module: Anti-Entropy Loop API Reference"
+sidebarTitle: "Gossip"
+description: "Anti-entropy gossip loop API for Aether Sync — covers gossip_loop parameters, full-state broadcast behavior, GOSSIP message format, and thread usage."
+---
+
+The `gossip` module provides a single function, `gossip_loop`, which runs an infinite anti-entropy broadcast loop in a background daemon thread. Every `GOSSIP_INTERVAL` seconds (default 3 seconds, from `config.py`), it snapshots the entire local store and sends the full state to every known peer using the `Reliability` layer. This ensures that even if a PUT message is permanently lost or a node rejoins after a crash, the gossip protocol will eventually deliver all missing state without any manual intervention. Because gossip messages carry the complete store contents, they subsume any in-flight or previously dropped updates — making the system self-healing by design.
+
+## Source
+
+```python
+# Gossip thread
+
+import time
+from config import GOSSIP_INTERVAL
+
+def gossip_loop(peers, store, reliability):
+    while True:
+        time.sleep(GOSSIP_INTERVAL)
+        msg = {"type":"GOSSIP","store":store.get_all()}
+        for p in peers:
+            reliability.reliable_send(msg, p)
+```
+
+---
+
+## Function
+
+### `gossip_loop(peers, store, reliability)`
+
+Runs forever in a tight sleep-broadcast loop. On each iteration it calls `store.get_all()` to obtain a consistent snapshot of the current data, wraps it in a GOSSIP message, and calls `reliability.reliable_send` for each entry in `peers`. The function never returns; it is always executed in a daemon thread so that it does not prevent the Python process from exiting when the main thread finishes.
+
+<ParamField body="peers" type="list" required>
+  A list of `(ip, port)` tuples identifying the peer nodes to broadcast to. This is the same `peers` list that `node.py` maintains globally — items are appended to it when the user issues the `p` (add peer) command. Because `gossip_loop` reads `peers` on every iteration (not once at startup), peers added after the gossip thread has started are automatically included in subsequent broadcasts.
+</ParamField>
+
+<ParamField body="store" type="Store" required>
+  The shared `Store` instance. `gossip_loop` calls `store.get_all()` on every tick, which acquires the store's internal lock and returns a shallow copy. The gossip thread therefore never holds the lock while performing network I/O.
+</ParamField>
+
+<ParamField body="reliability" type="Reliability" required>
+  The shared `Reliability` instance. Each peer receives its own `reliable_send` call, so each message gets a unique sequence number and is tracked independently for ACK and retry purposes.
+</ParamField>
+
+<ResponseField name="(never returns)" type="None">
+  `gossip_loop` loops indefinitely. It only stops if the thread is terminated (e.g. because it is a daemon thread and the process exits).
+</ResponseField>
+
+---
+
+## GOSSIP Message Format
+
+Each broadcast produces a message of the following shape, serialized to JSON by `Transport.unreliable_send`:
+
+```json
+{
+  "type": "GOSSIP",
+  "store": {
+    "key": ["value", 1678156800.234, "node-1"],
+    "username": ["alice", 1678156805.567, "node-2"]
+  }
+}
+```
+
+The `"store"` field is a direct output of `Store.get_all()`. Because Python tuples are serialized as JSON arrays, receiving nodes call `Store.merge(msg["store"])` — and `merge` handles both Python lists and tuples via `tuple(incoming)` when storing each record.
+
+<Note>
+  GOSSIP messages carry the **full store state** on every broadcast. There is no delta or diff encoding. For small stores this is efficient; for large stores the serialized payload may approach the `BUFFER_SIZE` limit (default `4096` bytes). If the serialized message exceeds `BUFFER_SIZE`, `Transport.recv` will silently truncate the datagram.
+</Note>
+
+---
+
+## Thread Usage
+
+`node.py` starts `gossip_loop` as a daemon thread immediately before entering the user input loop:
+
+```python
+threading.Thread(
+    target=gossip_loop,
+    args=(peers, store, reliability),
+    daemon=True
+).start()
+```
+
+Setting `daemon=True` ensures the gossip thread is automatically killed when the main thread (`user_loop`) exits, preventing the process from hanging on shutdown.
+
+---
+
+## Starting Gossip in Your Own Code
+
+If you are embedding Aether Sync components in a Python application rather than running `node.py` directly, start the gossip thread after constructing `peers`, `store`, and `reliability`:
+
+```python
+import threading
+from gossip import gossip_loop
+
+threading.Thread(
+    target=gossip_loop,
+    args=(peers, store, reliability),
+    daemon=True
+).start()
+```
+
+After this call the gossip loop is running independently. Any changes you make to `peers` (appending new peer tuples) or to `store` (via `merge` or `put_local`) will be reflected in the next gossip broadcast automatically — no restart or reconfiguration is needed.
+
+<Tip>
+  To tune convergence speed, lower `GOSSIP_INTERVAL` in `config.py`. At the default of `3` seconds, a freshly joined node receives its first full-state sync within 3 seconds of being added to a peer's `peers` list. Reducing to `1` second trades CPU and bandwidth for faster convergence.
+</Tip>
+
+<Warning>
+  Because `reliable_send` stamps each gossip broadcast with a unique sequence number and tracks it in `Reliability.pending`, a high-churn cluster with many peers and a large store can cause `pending` to grow quickly if peers are slow to ACK. Monitor the size of `reliability.pending` in production to detect unreachable peers early.
+</Warning>

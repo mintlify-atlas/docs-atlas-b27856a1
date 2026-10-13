@@ -1,0 +1,161 @@
+---
+title: "Store Module: CRDT LWW Dictionary API Reference"
+sidebarTitle: "Store"
+description: "Thread-safe CRDT Last-Write-Wins dictionary API for Aether Sync — covers Store class methods, merge conflict resolution, and local write operations."
+---
+
+The `Store` class is the heart of Aether Sync's state management layer. It implements a **CRDT Last-Write-Wins (LWW) element dictionary**: every value stored is a 3-tuple of `(value, timestamp, node_id)`, and all conflict resolution is deterministic and commutative. Because multiple threads — the listener, gossip, and user loop — all read and write store state concurrently, every method acquires a `threading.Lock` before touching `self.data`. The store is intentionally minimal: it owns no sockets, no timers, and no network state, making it straightforward to test, snapshot, and restore in isolation.
+
+## Source
+
+```python
+# CRDT Last-Write-Wins store
+
+import threading
+
+class Store:
+    def __init__(self):
+        self.data = {}
+        self.lock = threading.Lock()
+
+    def merge(self, remote):
+        with self.lock:
+            for k, incoming in remote.items():
+                if k not in self.data:
+                    self.data[k] = tuple(incoming)
+                else:
+                    v, ts, n = self.data[k]
+                    iv, its, inode = incoming
+                    if its > ts or (its == ts and inode > n):
+                        self.data[k] = tuple(incoming)
+
+    def put_local(self, key, record):
+        with self.lock:
+            self.data[key] = record
+
+    def get_all(self):
+        with self.lock:
+            return dict(self.data)
+```
+
+## Constructor
+
+### `Store.__init__()`
+
+Initializes an empty store with no data and a fresh mutex lock. No arguments are required.
+
+<ParamField body="(no parameters)" type="—">
+  `Store()` takes no arguments. Internally it sets `self.data = {}` and `self.lock = threading.Lock()`.
+</ParamField>
+
+**Returns:** A new `Store` instance ready for concurrent use.
+
+---
+
+## Methods
+
+### `Store.merge(remote)`
+
+Merges an incoming dictionary of records into the local store using **Last-Write-Wins** conflict resolution. Each key in `remote` is compared against the corresponding key in `self.data`; the record with the strictly later timestamp wins. When timestamps are equal, the record belonging to the lexicographically larger node ID wins, guaranteeing a deterministic, tie-breaking total order across all replicas.
+
+The entire merge loop is wrapped in `self.lock`, so concurrent calls from the listener thread and the gossip thread are serialized safely.
+
+<ParamField body="remote" type="dict" required>
+  A dictionary whose keys are string keys and whose values are either tuples or lists of the form `(value, timestamp, node_id)`:
+
+  - **value** (`str`) — The payload to store for this key.
+  - **timestamp** (`float`) — A Unix epoch float produced by `time.time()` at write time.
+  - **node_id** (`str`) — The originating node's identifier (e.g. `"node-1"`). Used as a tie-breaker when timestamps are equal.
+
+  When this method is called with a GOSSIP message's `"store"` field, values arrive as JSON arrays (lists). `merge` converts each incoming value to a `tuple` before storing it.
+</ParamField>
+
+<ResponseField name="(no return value)" type="None">
+  `merge` modifies `self.data` in place and returns `None`.
+</ResponseField>
+
+---
+
+### `Store.put_local(key, record)`
+
+Writes a single record directly into the store, bypassing merge conflict resolution entirely. This is the path used by `node.py`'s `user_loop` after the user inserts a key — the record is written locally before it is broadcast to peers, so the local node reflects the change immediately regardless of any in-flight gossip.
+
+<ParamField body="key" type="str" required>
+  The key to write. Must be a non-empty string. `node.py` validates that the key is not empty before calling this method.
+</ParamField>
+
+<ParamField body="record" type="tuple" required>
+  A 3-tuple `(value, timestamp, node_id)` to store verbatim:
+
+  - **value** (`str`) — The payload.
+  - **timestamp** (`float`) — `time.time()` at the moment of the local write.
+  - **node_id** (`str`) — The local `NODE_ID`, set at startup.
+</ParamField>
+
+<ResponseField name="(no return value)" type="None">
+  Modifies `self.data` in place and returns `None`.
+</ResponseField>
+
+---
+
+### `Store.get_all()`
+
+Returns a **shallow copy** of `self.data` as a plain `dict`. Callers receive a snapshot of the store at the moment of the call; subsequent writes do not affect the returned dict. The gossip loop calls `get_all()` every `GOSSIP_INTERVAL` seconds to construct the GOSSIP broadcast message.
+
+<ResponseField name="data copy" type="dict">
+  A `dict` mapping string keys to 3-tuples `(value, timestamp, node_id)`. The copy is produced under `self.lock`, so it is always internally consistent.
+</ResponseField>
+
+---
+
+## Usage Example
+
+```python
+from store import Store
+import time
+
+s = Store()
+
+# Merge an incoming record (as received from a peer's GOSSIP message)
+s.merge({"key": ("value", time.time(), "node-1")})
+print(s.get_all())  # {'key': ('value', <ts>, 'node-1')}
+
+# Write a local key directly (used by the user_loop in node.py)
+ts = time.time()
+s.put_local("username", ("alice", ts, "node-1"))
+
+# Snapshot the entire store
+snapshot = s.get_all()
+print(snapshot)
+# {'key': ('value', <ts1>, 'node-1'), 'username': ('alice', <ts2>, 'node-1')}
+```
+
+---
+
+## Conflict Resolution Behavior
+
+Every record in the store carries a physical timestamp and a node identifier. When `merge` encounters a key that already exists locally, it applies a two-level comparison:
+
+<Steps>
+  <Step title="Compare timestamps">
+    If the incoming timestamp (`its`) is **strictly greater than** the local timestamp (`ts`), the incoming record replaces the local one. This is the common case: whichever write happened later in physical time wins.
+  </Step>
+  <Step title="Tie-break by node ID">
+    If the timestamps are **exactly equal** (`its == ts`), `merge` compares node identifiers lexicographically. The record whose `node_id` is lexicographically larger wins (e.g. `"node-2"` beats `"node-1"`). This rule is deterministic and commutative: every replica in the cluster will reach the same conclusion independently, even if they receive the two conflicting records in opposite order.
+  </Step>
+  <Step title="Discard stale incoming records">
+    If neither condition is satisfied — the incoming timestamp is older, or equal with a smaller node ID — the local record is retained unchanged and the incoming record is silently discarded.
+  </Step>
+</Steps>
+
+<Note>
+  Because the merge function converts every incoming value to a `tuple` via `tuple(incoming)`, it is safe to pass either Python tuples or JSON-decoded lists (which arrive as Python `list` objects) as values in `remote`.
+</Note>
+
+<Note>
+  `merge` is **idempotent**: applying the same remote dict twice produces the same result as applying it once. This property is essential for gossip retransmission — duplicate GOSSIP messages never corrupt the store.
+</Note>
+
+<Warning>
+  The store is **in-memory only**. All state is lost if the process exits. To persist state across restarts, snapshot the store with `get_all()` and serialize it to disk (e.g., JSON) before shutdown, then restore it on startup by passing the loaded dict back to `merge`.
+</Warning>

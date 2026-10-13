@@ -1,0 +1,129 @@
+---
+title: "Transport Layer: UDP Sockets and Loss Simulation"
+sidebarTitle: "Transport Layer"
+description: "How Aether Sync's Transport class binds a UDP socket, serializes messages as JSON, and simulates packet loss with a configurable LOSS_PROB dropout value."
+---
+
+The Transport layer is the lowest rung of the Aether Sync stack. It owns one UDP socket per node, handles all raw I/O, and is the only layer in the system that ever calls `socket.sendto` or `socket.recvfrom`. Every layer above it speaks in Python dicts; Transport is responsible for turning those dicts into bytes on the wire and back again. Crucially, Transport is also where network chaos is injected: before every send it consults a configurable probability value and may silently drop the packet, faithfully modelling real-world packet loss without any external tooling.
+
+## The Transport Class
+
+```python
+# Low-level UDP transport + loss simulation
+
+import socket, json, random
+from config import LOSS_PROB, BUFFER_SIZE
+
+class Transport:
+    def __init__(self, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", port))
+
+    def unreliable_send(self, msg, addr):
+        if random.random() < LOSS_PROB:
+            return
+        self.sock.sendto(json.dumps(msg).encode(), addr)
+
+    def recv(self):
+        data, addr = self.sock.recvfrom(BUFFER_SIZE)
+        return json.loads(data.decode()), addr
+```
+
+## Constructor: `__init__(port)`
+
+Calling `Transport(port)` does two things:
+
+1. **Creates a `SOCK_DGRAM` socket** — a connectionless UDP socket. Unlike TCP, UDP carries no connection state, no ordering guarantees, and no built-in retransmission. These properties are intentional: they keep latency low and push reliability concerns into the dedicated Reliability layer above.
+2. **Binds to `127.0.0.1` on the given port** — the socket is immediately ready to receive inbound datagrams on that address/port combination.
+
+<Note>
+  All nodes in the default configuration bind to `127.0.0.1`, which restricts communication to the local machine. To form a cluster across multiple hosts, change the bind address to `0.0.0.0` (listen on all interfaces) and ensure peer addresses in `peers` point to the correct remote IPs.
+</Note>
+
+## `unreliable_send(msg, addr)`
+
+This method is the packet-loss simulation heart of Aether Sync:
+
+```python
+def unreliable_send(self, msg, addr):
+    if random.random() < LOSS_PROB:
+        return                                   # silent drop — no error, no log
+    self.sock.sendto(json.dumps(msg).encode(), addr)
+```
+
+The logic has three steps:
+
+1. **Draw a random float** in `[0.0, 1.0)` using `random.random()`.
+2. **Compare against `LOSS_PROB`** — if the draw falls below the threshold, the method returns immediately without touching the socket. The caller is never informed of the drop; this mirrors how real UDP packet loss appears to the sender.
+3. **Serialize and send** — if the packet survives the lottery, `msg` (a plain Python dict) is serialized to a JSON-encoded byte string and handed to `socket.sendto`. No framing, no length prefix, no connection state.
+
+The name `unreliable_send` is a deliberate contract: callers in the Reliability layer know they must assume this call may do nothing, and they plan accordingly.
+
+## Packet Loss Simulation Logic
+
+The `LOSS_PROB` value drives the chaos model. With the default value of `0.3`, every packet has a 30% chance of being silently discarded before it ever reaches the network stack:
+
+```python
+# config.py
+LOSS_PROB = 0.3      # 30% of outgoing packets are silently dropped
+BUFFER_SIZE = 4096   # Maximum UDP receive buffer in bytes
+```
+
+You can tune this to model different network conditions:
+
+| `LOSS_PROB` | Effective delivery rate | Scenario modelled |
+|-------------|------------------------|-------------------|
+| `0.0` | 100% | Perfect LAN / data-centre |
+| `0.1` | 90% | Lightly congested WAN |
+| `0.3` | 70% | Default — noisy wireless / lossy link |
+| `0.5` | 50% | Severe congestion or partial partition |
+| `0.9` | 10% | Near-partition stress test |
+
+To change the loss probability, edit `config.py` before starting any node:
+
+```python
+# config.py — reduce loss for a cleaner local demo
+LOSS_PROB = 0.0
+```
+
+## `recv()`
+
+```python
+def recv(self):
+    data, addr = self.sock.recvfrom(BUFFER_SIZE)
+    return json.loads(data.decode()), addr
+```
+
+`recv()` is a **blocking call**. It waits until a UDP datagram arrives on the bound socket, reads up to `BUFFER_SIZE` bytes (default 4 096), JSON-decodes the payload, and returns a `(dict, sender_addr)` tuple. The calling thread — the `listener()` loop in `node.py` — is suspended in the kernel during the wait, consuming no CPU.
+
+<Note>
+  Because `recv()` blocks indefinitely, the listener must run on a dedicated daemon thread. Calling it on the main thread would freeze the interactive prompt. `node.py` handles this by spawning `threading.Thread(target=listener, daemon=True)`.
+</Note>
+
+## Message Serialization
+
+All messages exchanged between nodes are plain Python dicts serialized as JSON. For example, a PUT message looks like this on the wire:
+
+```json
+{
+  "type": "PUT",
+  "from": "node-1",
+  "key": "user:42:name",
+  "value": "Alice",
+  "ts": 1678156800.234,
+  "seq": 42
+}
+```
+
+JSON was chosen for its simplicity and human-readability during debugging. The trade-off is that it is not the most compact binary format; for high-throughput deployments, MessagePack or protobuf could replace JSON encoding without changing any other layer.
+
+## Configuration Reference
+
+Both constants consumed by Transport come from `config.py`:
+
+```python
+LOSS_PROB = 0.3      # Fraction of sends to silently drop (0.0–1.0)
+BUFFER_SIZE = 4096   # Maximum bytes read per recvfrom() call
+```
+
+`BUFFER_SIZE` caps the maximum message size at 4 096 bytes. For clusters with large stores, the GOSSIP message (which carries the entire store as JSON) may exceed this limit. If truncation occurs the JSON decode will raise an exception in `recv()`. Increase `BUFFER_SIZE` proportionally to your expected store size when running at scale.

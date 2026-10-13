@@ -1,0 +1,94 @@
+---
+title: "Aether Sync Performance Characteristics"
+sidebarTitle: "Performance"
+description: "Understand Aether Sync's latency, throughput, memory usage, and fault tolerance metrics, and learn which config parameters to tune for your workload."
+---
+
+Aether Sync is a reference implementation optimized for correctness, simplicity, and chaos resilience — not raw throughput. Its performance profile is shaped by two primary mechanisms: ACK-based reliable delivery over UDP for individual writes, and a full-state gossip broadcast every `GOSSIP_INTERVAL` seconds for anti-entropy repair. Understanding both mechanisms is essential for predicting how the system will behave under your specific workload and network conditions.
+
+## Performance Metrics
+
+The following measurements reflect default configuration (`LOSS_PROB = 0.3`, `GOSSIP_INTERVAL = 3`, `BUFFER_SIZE = 4096`) running on a single machine with loopback networking. Production deployments over real networks will see higher latency figures and lower throughput, scaled by the actual network characteristics.
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Message Latency** (1-hop) | ~1–5ms | Localhost UDP round-trip; scales with physical network latency |
+| **Cluster Convergence** | ~6–9s | 2–3 gossip cycles at default `GOSSIP_INTERVAL = 3s` |
+| **Throughput** (single node) | 1K–10K ops/sec | Dependent on CPU speed and network I/O capacity |
+| **Memory Per Node** | ~1–10MB baseline | Grows linearly with data size; no garbage collection on pending messages |
+| **Fault Tolerance** | N-1 failures | Requires at least 1 live node for continued operation |
+| **Network Overhead** | ~3KB per gossip cycle | Full state broadcast every `GOSSIP_INTERVAL` seconds |
+
+The throughput figure spans a wide range because it is gated by the Python GIL, the single-threaded listener loop, and the JSON serialization cost per message. Workloads with small values (short strings) and infrequent writes stay near the high end; workloads with large values or high write concurrency approach the low end.
+
+## Tuning for Performance
+
+Three parameters in `config.py` directly control the performance envelope:
+
+```python
+# config.py
+LOSS_PROB = 0.3        # Set to 0.0 in production to disable packet drop simulation
+RETRY_INTERVAL = 2     # Seconds between retransmissions; reduce for faster recovery
+GOSSIP_INTERVAL = 3    # Seconds between full anti-entropy broadcasts
+BUFFER_SIZE = 4096     # Maximum UDP datagram size in bytes
+```
+
+**`GOSSIP_INTERVAL`** is the primary convergence knob. Reducing it speeds up state propagation but increases steady-state network traffic linearly. At 3 seconds with a 3 KB full-state payload, a 3-node cluster generates approximately 6 KB/s of gossip traffic (2 peers × 1 gossip/3s × 3 KB). At 1 second, that triples to ~18 KB/s. On bandwidth-constrained links or clusters with large stores, keep `GOSSIP_INTERVAL` at 3 seconds or higher.
+
+**`BUFFER_SIZE`** limits the maximum size of a single UDP datagram. The default of 4096 bytes constrains how much state can be gossiped in one packet. If the serialized store exceeds this size, gossip messages will be silently truncated and peers will receive incomplete state. For stores with many keys or large values, increase `BUFFER_SIZE` proportionally — common values are 8192 or 65507 (the UDP maximum).
+
+**`LOSS_PROB`** should be set to `0.0` in any environment where you are not intentionally testing chaos resilience. Leaving it at `0.3` in a production deployment artificially drops 30% of all outbound messages, forcing the retry and gossip layers to compensate and degrading effective throughput significantly.
+
+## Memory Growth Analysis
+
+Each node holds the full dataset in the `Store` object's `self.data` dictionary — one Python dict entry per key. Memory consumption grows linearly with the number of keys and the average value size:
+
+```python
+# store.py — in-memory CRDT store
+class Store:
+    def __init__(self):
+        self.data = {}          # Grows without bound as keys are added
+        self.lock = threading.Lock()
+```
+
+There is no key expiration, no compaction, and no eviction. In a long-running cluster that continuously inserts new keys, the store will grow until the process runs out of heap memory.
+
+The `pending` queue in the reliability layer compounds this problem. Every outbound PUT message is held in the pending queue until an ACK is received. If a peer disappears permanently, its unacknowledged messages remain in the queue indefinitely:
+
+<Warning>
+  The pending messages queue in the reliability layer has no TTL or maximum size. If a peer node disappears without sending ACKs, every message sent to that peer accumulates in memory forever. In a long-running cluster with peer churn, this is a genuine memory leak. Monitor process RSS over time and restart nodes if memory consumption grows unexpectedly. A configurable TTL for pending messages is on the [future roadmap](/operations/limitations).
+</Warning>
+
+For the data store itself, the recommended workaround for unbounded growth is periodic JSON snapshot exports combined with a controlled restart:
+
+```python
+import json
+
+# Export current state before restart
+snapshot = store.get_all()
+with open("state_backup.json", "w") as f:
+    json.dump(snapshot, f)
+
+# On restart, restore from snapshot
+with open("state_backup.json", "r") as f:
+    restored = json.load(f)
+    store.merge(restored)
+```
+
+This does not solve the missing GC problem, but it prevents unbounded store growth by allowing operators to prune stale keys before exporting.
+
+## Network Overhead Analysis
+
+Aether Sync uses a **full-state gossip** strategy: every `GOSSIP_INTERVAL` seconds, each node serializes its entire `Store` to JSON and broadcasts it to all known peers. This is the simplest possible anti-entropy implementation and has significant trade-offs compared to a delta-sync approach.
+
+**Full-state gossip — advantages:**
+- Trivially correct: a node that missed any number of previous gossip rounds catches up completely in a single cycle
+- No tombstone or version-vector bookkeeping required
+- Idempotent by construction — replaying a gossip message has no side effects
+
+**Full-state gossip — disadvantages:**
+- Network overhead grows linearly with store size, regardless of how many keys actually changed since the last cycle
+- A store with 10,000 keys and 100-byte average values generates ~1 MB per gossip message per peer — far exceeding the default `BUFFER_SIZE` of 4096 bytes
+- No prioritization of recently changed keys; hot keys and cold keys are treated identically
+
+The ~3 KB per gossip cycle figure in the metrics table assumes a small store (tens of keys with short string values). Real deployments should measure their serialized store size and adjust `BUFFER_SIZE` accordingly. A future delta-sync implementation would track which keys changed since the last gossip epoch and broadcast only the diff, reducing network overhead to O(changes) rather than O(store size). This is a planned improvement documented in [Known Limitations](/operations/limitations).

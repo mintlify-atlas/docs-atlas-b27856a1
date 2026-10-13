@@ -1,0 +1,156 @@
+---
+title: "Reliability Module: ACK-Based Delivery API Reference"
+sidebarTitle: "Reliability"
+description: "ACK-based reliable delivery API for Aether Sync — covers sequence numbers, pending message tracking, ACK handling, and the 2-second retry loop over UDP."
+---
+
+The `Reliability` class sits directly above `Transport` in Aether Sync's layered architecture. It adds guaranteed eventual delivery on top of lossy UDP by assigning each outgoing message a monotonically increasing **sequence number**, tracking every unacknowledged message in a `pending` dictionary, and periodically retransmitting messages that have not been acknowledged within two seconds. When a peer successfully receives a message it sends back an ACK; `handle_ack` removes that sequence number from `pending`, stopping further retries. The result is a simple but effective stop-and-wait reliability layer that compensates for the simulated packet loss introduced by `Transport.unreliable_send`.
+
+## Source
+
+```python
+# Reliability layer: seq numbers + ACK + retry
+
+import time
+
+class Reliability:
+    def __init__(self, transport):
+        self.transport = transport
+        self.seq = 0
+        self.pending = {}
+
+    def reliable_send(self, msg, addr):
+        self.seq += 1
+        msg["seq"] = self.seq
+        self.pending[self.seq] = (msg, addr, time.time())
+        self.transport.unreliable_send(msg, addr)
+
+    def handle_ack(self, seq):
+        if seq in self.pending:
+            del self.pending[seq]
+
+    def retry(self):
+        now = time.time()
+        for s,(m,a,t) in list(self.pending.items()):
+            if now - t > 2:
+                self.pending[s] = (m,a,now)
+                self.transport.unreliable_send(m,a)
+```
+
+## Constructor
+
+### `Reliability.__init__(transport)`
+
+Stores a reference to the provided `Transport` instance, initializes the sequence counter to `0`, and creates an empty `pending` dict. Every node in `node.py` constructs exactly one `Reliability` instance, sharing it between the `reliable_send` call path in `user_loop` and the retry thread.
+
+<ParamField body="transport" type="Transport" required>
+  A constructed and bound `Transport` instance. `Reliability` calls `transport.unreliable_send` for both initial sends and retries — it never touches the socket directly.
+</ParamField>
+
+**Returns:** A `Reliability` instance with `self.seq = 0` and `self.pending = {}`.
+
+---
+
+## Methods
+
+### `Reliability.reliable_send(msg, addr)`
+
+Assigns the next sequence number to `msg`, records the message in `self.pending` with its send timestamp, and calls `transport.unreliable_send` to dispatch it. If the packet is dropped (simulated loss), the message remains in `pending` and will be retransmitted the next time `retry()` fires.
+
+<ParamField body="msg" type="dict" required>
+  A JSON-serializable dict to send. `reliable_send` mutates this dict in place by adding a `"seq"` key before dispatching:
+
+  ```python
+  msg["seq"] = self.seq  # e.g. {"type": "PUT", ..., "seq": 3}
+  ```
+
+  The recipient uses `msg["seq"]` to construct the ACK reply, so callers must not modify `msg` after passing it to this method.
+</ParamField>
+
+<ParamField body="addr" type="tuple" required>
+  A `(ip, port)` tuple identifying the destination peer.
+</ParamField>
+
+<ResponseField name="(no return value)" type="None">
+  Returns `None`. Delivery confirmation arrives asynchronously via `handle_ack`.
+</ResponseField>
+
+---
+
+### `Reliability.handle_ack(seq)`
+
+Removes the message identified by `seq` from `self.pending`, signalling that the peer has successfully received and processed it. No further retries will be attempted for that sequence number. Called by `node.py`'s listener thread whenever a message of type `"ACK"` arrives.
+
+<ParamField body="seq" type="int" required>
+  The sequence number from the received ACK message (`msg["seq"]`). If `seq` is not present in `self.pending` (e.g. a duplicate ACK), the call is a no-op.
+</ParamField>
+
+<ResponseField name="(no return value)" type="None">
+  Returns `None`. Safe to call with a sequence number that is no longer pending.
+</ResponseField>
+
+---
+
+### `Reliability.retry()`
+
+Scans `self.pending` for any message whose recorded send time is more than **2 seconds** in the past, resets its timestamp to the current time, and retransmits it via `transport.unreliable_send`. This method is called by the `retry_loop` thread in `node.py` once per second, so the effective retry window is between 2 and 3 seconds after the previous send attempt.
+
+<ResponseField name="(no return value)" type="None">
+  Modifies `self.pending` in place (updating timestamps) and returns `None`. Uses `list(self.pending.items())` to iterate over a snapshot of the dict, so entries added or removed concurrently during iteration do not raise `RuntimeError`.
+</ResponseField>
+
+---
+
+## Pending Message Lifecycle
+
+The following diagram traces a single message from first send to final acknowledgement, including the retry path:
+
+<Steps>
+  <Step title="reliable_send called">
+    `self.seq` is incremented and written into the message as `"seq"`. The tuple `(msg, addr, time.time())` is inserted into `self.pending[seq]`. `transport.unreliable_send` is called — the packet may or may not reach the peer.
+  </Step>
+  <Step title="ACK received (happy path)">
+    The peer's listener receives the message and immediately calls `transport.unreliable_send({"type": "ACK", "seq": seq}, addr)`. The local listener thread receives the ACK and calls `reliability.handle_ack(seq)`, which deletes the entry from `self.pending`. No further retries occur.
+  </Step>
+  <Step title="2-second timeout (retry path)">
+    If no ACK arrives within 2 seconds, the next `retry()` call detects that `now - t > 2`, resets the timestamp to `now`, and calls `transport.unreliable_send` again with the same message and sequence number. This repeats until an ACK is received.
+  </Step>
+  <Step title="Entry removed">
+    Once `handle_ack` removes the entry, the message lifecycle is complete. The sequence number is never reused (the counter only increments).
+  </Step>
+</Steps>
+
+---
+
+## Usage Example
+
+```python
+from transport import Transport
+from reliability import Reliability
+import time
+
+transport = Transport(5001)
+reliability = Reliability(transport)
+
+# Send a message with guaranteed retry on loss
+reliability.reliable_send(
+    {"type": "PUT", "from": "node-1", "key": "x", "value": "42", "ts": time.time()},
+    ("127.0.0.1", 5002)
+)
+
+# In the retry thread (called every second):
+reliability.retry()
+
+# When an ACK arrives in the listener thread:
+reliability.handle_ack(seq=1)
+```
+
+---
+
+<Warning>
+  `self.pending` has **no TTL or maximum size**. If a peer disappears permanently (crash, network partition), messages destined for that peer accumulate in `pending` indefinitely. Over time this causes unbounded memory growth and an increasing volume of futile retransmissions. For long-running clusters, implement a configurable TTL that calls `del self.pending[seq]` after a maximum number of retry attempts or a wall-clock deadline.
+</Warning>
+
+<Note>
+  The retry interval is a fixed **2 seconds** (hardcoded in `retry()`), independent of the `RETRY_INTERVAL` value in `config.py`. `RETRY_INTERVAL` controls how often `node.py`'s `retry_loop` thread calls `reliability.retry()` — currently set to `1` second — not the per-message backoff window.
+</Note>

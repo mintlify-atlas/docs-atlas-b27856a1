@@ -1,0 +1,115 @@
+---
+title: "Aether Sync Architecture: Four-Layer Design"
+sidebarTitle: "Overview"
+description: "Explore Aether Sync's four-layer stack: UDP transport, ACK reliability, anti-entropy gossip, and a CRDT last-write-wins store for eventual consistency."
+---
+
+Aether Sync is built around a strict separation of concerns across four composable layers. Each layer owns exactly one responsibility — raw network I/O, delivery guarantees, state propagation, or conflict resolution — and exposes a narrow interface to the layer above it. This design means individual layers can be reasoned about, tested, and replaced in isolation without touching the rest of the system.
+
+## The Four-Layer Stack
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│  APPLICATION LAYER                                      │
+│  (Multi-master read/write semantics)                    │
+├─────────────────────────────────────────────────────────┤
+│  GOSSIP LAYER                                           │
+│  (Anti-entropy protocol, periodic state sync)           │
+├─────────────────────────────────────────────────────────┤
+│  RELIABILITY LAYER                                      │
+│  (Seq numbers, ACK handling, retry logic)               │
+├─────────────────────────────────────────────────────────┤
+│  TRANSPORT LAYER                                        │
+│  (UDP sockets, packet loss simulation)                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Layer Responsibilities
+
+### Transport Layer (`transport.py`)
+
+The foundation of the stack. It owns a raw UDP socket, serializes Python dicts to JSON on the wire, and deliberately simulates network chaos by silently dropping a configurable fraction of outgoing packets. Nothing above it assumes reliable delivery — that guarantee is rebuilt by the layer above.
+
+### Reliability Layer (`reliability.py`)
+
+Sits directly on top of Transport. It assigns monotonically increasing sequence numbers to every outgoing message, tracks unacknowledged messages in an in-memory dict, and reschedules retransmission for any message that has not been ACK'd within two seconds. It neither knows nor cares what the payload means.
+
+### Gossip Layer (`gossip.py`)
+
+A background thread that fires on a fixed interval (default every three seconds). On each tick it serializes the node's entire key-value store and broadcasts it to every known peer using the Reliability layer. This anti-entropy sweep ensures that keys missed by point-to-point PUT messages are eventually recovered without any central coordinator.
+
+### Store Layer (`store.py`)
+
+The CRDT engine at the top of the stack. It stores each key as a 3-tuple `(value, timestamp, node_id)` and resolves concurrent writes deterministically: the entry with the later timestamp wins; ties are broken by lexicographic comparison of node IDs. The merge operation is commutative and idempotent, so gossip retransmissions and out-of-order delivery never corrupt the store.
+
+## How the Layers Compose
+
+Every write by a user flows downward through all four layers before hitting the wire, and every inbound message travels upward until it reaches the store:
+
+```text
+Write path (top → bottom)
+─────────────────────────
+user_loop()           →  store.merge()  (local write)
+                      →  reliability.reliable_send(PUT, peer)
+                            → transport.unreliable_send(msg, addr)
+                                  → socket.sendto(...)  [may be dropped]
+
+Read path (bottom → top)
+─────────────────────────
+socket.recvfrom()     →  transport.recv()
+                      →  listener() dispatches on msg["type"]
+                            PUT     → store.merge()  +  send ACK
+                            GOSSIP  → store.merge()
+                            ACK     → reliability.handle_ack()
+```
+
+The Gossip layer runs on its own thread in parallel, periodically injecting full-state GOSSIP messages into the same Reliability → Transport pipeline.
+
+## Data Flow Diagram
+
+```text
+Node A                                Node B
+──────                                ──────
+user: put("x", "1")
+  │
+  ├─► store.merge({"x": ("1", T, "A")})
+  │
+  └─► reliability.reliable_send(PUT{x=1, seq=7}, B)
+            │
+            ▼
+      transport.unreliable_send()
+            │   [30% chance: silently dropped]
+            │
+            ▼  (if delivered)
+                              transport.recv()
+                              listener() → store.merge()
+                              transport.unreliable_send(ACK{seq=7}, A)
+            │
+            ▼
+      reliability.handle_ack(7)
+      pending[7] removed ✓
+
+      [if ACK never arrives within 2 s]
+      retry_loop() → transport.unreliable_send(PUT{x=1, seq=7}, B)
+            │
+            └─ repeats until ACK received
+```
+
+Every three seconds, the Gossip layer broadcasts the full store regardless of pending ACKs, providing a backstop that guarantees convergence even when individual PUT retries are still in flight.
+
+## Explore Each Layer
+
+<CardGroup cols={2}>
+  <Card title="Transport Layer" icon="network-wired" href="/architecture/transport-layer">
+    UDP socket binding, JSON serialization, and configurable packet-loss simulation via `LOSS_PROB`.
+  </Card>
+  <Card title="Reliability Layer" icon="rotate" href="/architecture/reliability-layer">
+    Sequence numbers, ACK tracking, and the two-second retry window that rebuilds delivery guarantees over UDP.
+  </Card>
+  <Card title="Gossip Layer" icon="bullhorn" href="/architecture/gossip-layer">
+    Periodic anti-entropy broadcasts that propagate the full store state to every peer on a fixed interval.
+  </Card>
+  <Card title="Store Layer" icon="database" href="/architecture/store-layer">
+    The CRDT last-write-wins dictionary with thread-safe merges and deterministic conflict resolution.
+  </Card>
+</CardGroup>

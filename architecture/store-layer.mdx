@@ -1,0 +1,164 @@
+---
+title: "Store Layer: CRDT Last-Write-Wins Dictionary"
+sidebarTitle: "Store Layer"
+description: "How Aether Sync's Store implements a CRDT last-write-wins dictionary with timestamp-then-node-ID conflict resolution, mutex safety, and idempotent merges."
+---
+
+Every piece of replicated state in Aether Sync ultimately lives in the Store. It is the top of the processing stack and the only component that holds persistent (in-memory) data. The Store implements a **CRDT Last-Write-Wins (LWW) element dictionary**: each key maps to a 3-tuple `(value, timestamp, node_id)`, and when two nodes hold conflicting values for the same key, the one with the later timestamp wins. Ties are broken by lexicographic comparison of node IDs, making conflict resolution deterministic, commutative, and independent of the order in which updates arrive. Merge operations are also idempotent, so gossip retransmissions and duplicate deliveries never corrupt the stored state.
+
+## The Store Class
+
+```python
+# CRDT Last-Write-Wins store
+
+import threading
+
+class Store:
+    def __init__(self):
+        self.data = {}
+        self.lock = threading.Lock()
+
+    def merge(self, remote):
+        with self.lock:
+            for k, incoming in remote.items():
+                if k not in self.data:
+                    self.data[k] = tuple(incoming)
+                else:
+                    v, ts, n = self.data[k]
+                    iv, its, inode = incoming
+                    if its > ts or (its == ts and inode > n):
+                        self.data[k] = tuple(incoming)
+
+    def put_local(self, key, record):
+        with self.lock:
+            self.data[key] = record
+
+    def get_all(self):
+        with self.lock:
+            return dict(self.data)
+```
+
+## Data Structure
+
+Every value in `self.data` is a **3-tuple**: `(value, timestamp, node_id)`.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `value` | `str` | The application-level payload |
+| `timestamp` | `float` | Unix wall-clock time (`time.time()`) at the writing node |
+| `node_id` | `str` | Unique string identifier of the node that produced the write |
+
+A live store with three keys looks like this:
+
+```python
+store.data = {
+    "user:42:name":  ("Alice",             1678156800.234, "node-1"),
+    "user:42:email": ("alice@example.com", 1678156805.567, "node-2"),
+    "counter":       ("100",               1678156810.890, "node-3")
+}
+```
+
+The tuple form means that a value is never partially updated: the entire `(value, timestamp, node_id)` is written atomically as a single object reference, which avoids torn reads even without fine-grained locking.
+
+## LWW Conflict Resolution Algorithm
+
+The `merge()` method is where CRDT semantics live. It accepts a `remote` dict (the payload of a PUT or GOSSIP message) and applies the LWW rule to every key:
+
+```python
+def merge(self, remote):
+    with self.lock:
+        for k, incoming in remote.items():
+            if k not in self.data:
+                self.data[k] = tuple(incoming)        # new key — accept unconditionally
+            else:
+                v, ts, n = self.data[k]
+                iv, its, inode = incoming
+                if its > ts or (its == ts and inode > n):
+                    self.data[k] = tuple(incoming)    # incoming wins
+                # else: local copy is newer or equal — keep it
+```
+
+The decision logic has two cases:
+
+1. **Key does not exist locally** — the incoming record is stored immediately, no comparison needed.
+2. **Key exists locally** — the algorithm applies the LWW rule:
+   - **Newer timestamp wins**: if `its > ts`, the incoming record replaces the local one.
+   - **Tie-break by node ID**: if `its == ts`, the record from the lexicographically larger node ID wins (e.g. `"node-2" > "node-1"`).
+   - **Local wins otherwise**: if the local timestamp is newer, or equal but the local node ID is larger, the incoming record is discarded.
+
+### Why This Works as a CRDT
+
+A data type qualifies as a CRDT if its merge operation is:
+
+- **Commutative**: `merge(A, B) == merge(B, A)` — the order of merges does not matter.
+- **Associative**: `merge(merge(A, B), C) == merge(A, merge(B, C))` — grouping of merges does not matter.
+- **Idempotent**: `merge(A, A) == A` — merging a record with itself changes nothing.
+
+The LWW rule satisfies all three properties. Because the winning record is always determined by the same deterministic comparison (`timestamp` then `node_id`), every node that has seen the same set of writes will hold the same final value, regardless of the order in which those writes arrived.
+
+## Idempotency Guarantee
+
+Because the merge comparison is strict (`its > ts` rather than `>=`), merging the exact same record twice produces no change:
+
+```python
+# First merge: key does not exist → accepted
+store.merge({"x": ("hello", 1678156800.0, "node-1")})
+
+# Second merge: same record → its == ts and inode == n → condition is False → no change
+store.merge({"x": ("hello", 1678156800.0, "node-1")})
+
+# Result: identical to after the first merge
+```
+
+This makes it safe for the Gossip and Reliability layers to retransmit the same message any number of times without introducing inconsistencies.
+
+## Thread Safety
+
+All three public methods acquire `self.lock` — a `threading.Lock()` — before touching `self.data`:
+
+```python
+def merge(self, remote):
+    with self.lock:
+        ...
+
+def put_local(self, key, record):
+    with self.lock:
+        ...
+
+def get_all(self):
+    with self.lock:
+        return dict(self.data)
+```
+
+`get_all()` returns a **shallow copy** of `self.data` (`dict(self.data)`). This means the gossip thread can safely iterate over the snapshot while the listener thread continues merging incoming updates into the live `self.data` without either thread blocking the other for longer than necessary.
+
+## `put_local(key, record)`
+
+`put_local` is used by `user_loop` in `node.py` to write the user's own value directly into the store without going through merge logic. Since the user is writing at this instant and the record will carry the current wall-clock timestamp, there is no need to compare against an older value — the caller is responsible for constructing a fresh `(value, time.time(), NODE_ID)` tuple before calling `put_local`.
+
+In the actual `node.py` user loop, writes use `store.merge()` rather than `put_local()`, passing a single-key dict. This is functionally equivalent for a brand-new write because the incoming timestamp will always be the newest value for that key at the moment the user types it.
+
+## Commutativity in Practice
+
+Consider two nodes writing to the same key concurrently:
+
+```text
+node-1 writes: ("10", T=1000.0, "node-1")
+node-2 writes: ("20", T=1000.1, "node-2")
+```
+
+Regardless of which gossip message each node receives first, the final state is the same:
+
+```python
+# node-1 receives node-2's value first, then its own arrives again via gossip:
+# 1000.1 > 1000.0  →  "20" wins
+
+# node-2 receives node-1's value first, then its own arrives again:
+# 1000.1 > 1000.0  →  "20" wins
+```
+
+Both nodes converge to `("20", 1000.1, "node-2")`. Commutativity is maintained.
+
+<Info>
+  The Store has no tombstone mechanism. Deleting a key is not directly supported. The standard workaround is to write a sentinel value such as `"DELETED"` at the current timestamp, which will propagate and win over any older value across the cluster.
+</Info>

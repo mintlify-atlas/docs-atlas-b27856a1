@@ -1,0 +1,117 @@
+---
+title: "Transport Module: UDP Socket API Reference"
+sidebarTitle: "Transport"
+description: "UDP socket send/receive API for Aether Sync — covers Transport class construction, packet loss simulation via LOSS_PROB, and blocking datagram receive."
+---
+
+The `Transport` class is the lowest layer of Aether Sync's networking stack. It wraps a single UDP socket bound to `127.0.0.1` on a caller-specified port and exposes two primitives: an **unreliable send** that intentionally drops packets with configurable probability to simulate real-world network chaos, and a **blocking receive** that decodes incoming JSON datagrams. Higher layers — `Reliability` and the gossip loop — build delivery guarantees on top of these two operations without needing to know anything about sockets or serialization.
+
+## Source
+
+```python
+# Low-level UDP transport + loss simulation
+
+import socket, json, random
+from config import LOSS_PROB, BUFFER_SIZE
+
+class Transport:
+    def __init__(self, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", port))
+
+    def unreliable_send(self, msg, addr):
+        if random.random() < LOSS_PROB:
+            return
+        self.sock.sendto(json.dumps(msg).encode(), addr)
+
+    def recv(self):
+        data, addr = self.sock.recvfrom(BUFFER_SIZE)
+        return json.loads(data.decode()), addr
+```
+
+## Constructor
+
+### `Transport.__init__(port)`
+
+Creates a UDP socket (`AF_INET / SOCK_DGRAM`) and binds it to `127.0.0.1` on the specified port. After construction, the socket is ready for both sending and receiving.
+
+<ParamField body="port" type="int" required>
+  The local UDP port to bind. Must be a free port in the range `1024–65535`. In `node.py` this value is read from the user at startup and passed directly to `Transport(PORT)`.
+</ParamField>
+
+**Returns:** A `Transport` instance with `self.sock` bound and ready.
+
+---
+
+## Methods
+
+### `Transport.unreliable_send(msg, addr)`
+
+Encodes `msg` as a UTF-8 JSON byte string and sends it to `addr` over UDP — but only if a random draw succeeds against `LOSS_PROB`. When the draw falls below `LOSS_PROB`, the method returns immediately without writing to the socket, simulating a silently dropped packet. This simulated loss is what exercises the retry logic in the `Reliability` layer.
+
+<ParamField body="msg" type="dict" required>
+  A JSON-serializable Python dict representing the message to send. Aether Sync uses three message shapes:
+
+  - `{"type": "PUT", "from": str, "key": str, "value": str, "ts": float, "seq": int}`
+  - `{"type": "GOSSIP", "store": dict}`
+  - `{"type": "ACK", "seq": int}`
+</ParamField>
+
+<ParamField body="addr" type="tuple" required>
+  A `(ip, port)` tuple identifying the destination, e.g. `("127.0.0.1", 5002)`.
+</ParamField>
+
+<ResponseField name="(no return value)" type="None">
+  Returns `None` in both the drop and the send case. Callers cannot distinguish a successful send from a simulated drop at this layer — that detection is left to the `Reliability` layer via ACK timeouts.
+</ResponseField>
+
+<Note>
+  `LOSS_PROB` is imported from `config.py` and defaults to `0.3`, meaning **30% of all outgoing packets are silently discarded** on every call to `unreliable_send`. This value applies uniformly to PUT, GOSSIP, and ACK messages alike. To disable loss simulation (e.g. in a production deployment), set `LOSS_PROB = 0.0` in `config.py`.
+</Note>
+
+---
+
+### `Transport.recv()`
+
+Blocks the calling thread until a UDP datagram arrives on the bound socket. When a packet is received, it is decoded from UTF-8 JSON into a Python dict and returned alongside the sender's address. The maximum datagram size is controlled by `BUFFER_SIZE` (default `4096` bytes), imported from `config.py`.
+
+<ResponseField name="msg" type="dict">
+  The decoded message payload as a Python dict. The `"type"` key indicates which handler in `node.py`'s `listener()` function should process it (`"PUT"`, `"GOSSIP"`, or `"ACK"`).
+</ResponseField>
+
+<ResponseField name="addr" type="tuple">
+  A `(ip, port)` tuple identifying the sender. For PUT messages, `node.py` uses this address to send back an ACK directly via `transport.unreliable_send(ack, addr)`.
+</ResponseField>
+
+<Warning>
+  `recv()` is a **blocking call** — it does not return until a packet arrives. It must always be called from a dedicated listener thread, never from the main thread or any thread that needs to remain responsive. In `node.py`, the listener thread is started as a daemon thread at startup:
+
+  ```python
+  threading.Thread(target=listener, daemon=True).start()
+  ```
+
+  If the listener thread exits unexpectedly (e.g. due to an unhandled exception inside the loop), no further messages will be processed and the node will stop responding silently.
+</Warning>
+
+---
+
+## Usage Example
+
+```python
+from transport import Transport
+
+# Bind a socket on port 5001
+t = Transport(5001)
+
+# Send a PUT message to a peer on port 5002 (may be silently dropped)
+t.unreliable_send({"type": "PUT", "key": "x", "value": "1"}, ("127.0.0.1", 5002))
+
+# Block until a datagram arrives; returns decoded dict and sender address
+msg, addr = t.recv()
+print(msg)   # e.g. {'type': 'ACK', 'seq': 1}
+print(addr)  # e.g. ('127.0.0.1', 5002)
+```
+
+<Tip>
+  To run multiple Aether Sync nodes on a single machine, give each node a distinct port number (e.g. `5001`, `5002`, `5003`). Each `Transport` instance binds to exactly one port, so port conflicts will raise an `OSError: [Errno 98] Address already in use` at startup.
+</Tip>

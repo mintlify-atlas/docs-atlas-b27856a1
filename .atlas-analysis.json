@@ -1,0 +1,101 @@
+{
+  "projectType": "general",
+  "projectName": "Aether Sync",
+  "projectDescription": "A resilient multi-master distributed state synchronization engine using CRDTs, anti-entropy gossip, and ACK-based reliability over UDP.",
+  "theme": "aspen",
+  "primaryColor": "#4F6BED",
+  "lightColor": "#7B93F5",
+  "darkColor": "#2A3F9E",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/transport-layer",
+              "architecture/reliability-layer",
+              "architecture/gossip-layer",
+              "architecture/store-layer"
+            ]
+          },
+          {
+            "group": "Configuration & Data Model",
+            "pages": [
+              "configuration",
+              "data-model"
+            ]
+          },
+          {
+            "group": "Testing & Operations",
+            "pages": [
+              "testing/chaos-engineering",
+              "testing/convergence-scenarios",
+              "operations/performance",
+              "operations/limitations"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Modules",
+            "pages": [
+              "api/store",
+              "api/transport",
+              "api/reliability",
+              "api/gossip",
+              "api/node"
+            ]
+          },
+          {
+            "group": "Message Protocol",
+            "pages": [
+              "api/messages",
+              "api/integration"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "CRDT Last-Write-Wins (LWW) store with deterministic conflict resolution",
+    "Anti-entropy gossip protocol for autonomous state convergence",
+    "ACK-based reliability layer with sequence numbers and retry logic over UDP",
+    "Configurable network chaos simulation (packet loss probability)",
+    "Multi-master architecture — all nodes accept reads and writes simultaneously",
+    "Thread-safe, mutex-locked store operations",
+    "Pure Python with zero external dependencies",
+    "Idempotent merge operations enabling safe replay and deduplication"
+  ],
+  "publicApiSurface": [
+    "Store.merge(remote: dict)",
+    "Store.put_local(key: str, record: tuple)",
+    "Store.get_all() -> dict",
+    "Transport.__init__(port: int)",
+    "Transport.unreliable_send(msg: dict, addr: tuple)",
+    "Transport.recv() -> (dict, tuple)",
+    "Reliability.__init__(transport: Transport)",
+    "Reliability.reliable_send(msg: dict, addr: tuple)",
+    "Reliability.handle_ack(seq: int)",
+    "Reliability.retry()",
+    "gossip_loop(peers: list, store: Store, reliability: Reliability)",
+    "config.LOSS_PROB",
+    "config.RETRY_INTERVAL",
+    "config.GOSSIP_INTERVAL",
+    "config.BUFFER_SIZE",
+    "node.py CLI commands: [p]peer, [i]put, [s]show"
+  ]
+}

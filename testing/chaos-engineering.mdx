@@ -1,0 +1,180 @@
+---
+title: "Chaos Engineering with Aether Sync"
+sidebarTitle: "Chaos Engineering"
+description: "Test Aether Sync's resilience using built-in packet loss simulation and Linux tc netem to validate eventual consistency under real-world chaos."
+---
+
+Aether Sync is built around a chaos-first design philosophy: rather than treating packet loss and network partitions as edge cases, the engine treats them as expected operating conditions. Every layer — from the UDP transport to the anti-entropy gossip protocol — is designed to make forward progress even when a third of all packets are silently dropped. This page explains how to exercise that resilience through built-in simulation and kernel-level network fault injection.
+
+## Built-in Chaos Simulation
+
+Aether Sync ships with a software-level packet loss simulator controlled by the `LOSS_PROB` parameter in `config.py`:
+
+```python
+# config.py
+LOSS_PROB = 0.3        # 30% of outbound packets are silently dropped
+RETRY_INTERVAL = 2     # Seconds between ACK timeout and retransmission
+GOSSIP_INTERVAL = 3    # Seconds between full anti-entropy broadcasts
+BUFFER_SIZE = 4096     # Maximum UDP packet size in bytes
+```
+
+The transport layer evaluates this probability on every send call. When a packet is "lost", the function returns silently — no error, no exception, no notification to the caller. The reliability layer's sequence-number-based retransmission and the gossip layer's periodic full-state broadcasts together ensure the data reaches its destination regardless:
+
+```python
+# Simulates network failures; 30% of packets dropped
+if random.random() < LOSS_PROB:
+    return  # Silent packet drop
+```
+
+Setting `LOSS_PROB = 0.0` disables simulation entirely for clean-network benchmarks. Setting it above `0.5` creates extremely hostile conditions that stress-test the retry and gossip recovery paths simultaneously.
+
+<Tip>
+  Vary `LOSS_PROB` to sweep through different test intensities without any external tooling. Use `0.1` for light turbulence, `0.3` for the default chaos baseline, and `0.6` for extreme stress testing. Values above `0.9` will cause convergence to stall, which is useful for testing partition-recovery behavior intentionally.
+</Tip>
+
+## Linux tc netem Packet Loss
+
+For hardware-level simulation that affects all processes on the machine — not just the Aether Sync transport layer — use the Linux `tc netem` subsystem. This injects real kernel-level packet drops on the loopback interface, making it impossible for any application code to "cheat" around the loss.
+
+<Warning>
+  The `tc` command requires Linux kernel support for the `netem` qdisc module. It works on most Linux distributions and on macOS with `dnctl`/`pfctl`. It is **not available natively on Windows**. Always run the cleanup command after your test to restore normal loopback networking; failing to do so will break all local inter-process communication on the machine.
+</Warning>
+
+```bash
+# Inject 30% packet loss on the loopback interface
+sudo tc qdisc add dev lo root netem loss 30%
+
+# Run your Aether Sync node tests here
+# (start nodes, insert data, observe convergence)
+
+# Remove the qdisc and restore normal networking
+sudo tc qdisc del dev lo root
+```
+
+You can combine `tc netem` with Aether Sync's built-in `LOSS_PROB` to model compound failure scenarios, such as a degraded physical network path (tc netem) with an additional application-layer fault budget (`LOSS_PROB`).
+
+## Scenario 1: Local Convergence Test
+
+This is the baseline validation scenario. It confirms that three independent node processes, running on localhost, converge to the same state within two gossip cycles under default configuration.
+
+**Setup:** Three terminal sessions, each running `python node.py` on ports 5001, 5002, and 5003. Each node must register the other two as peers using the `[p]` command.
+
+<Accordion title="Scenario 1 Steps and Expected Result">
+  **Steps:**
+
+  1. **Terminal 1** — Start node-1 on port 5001:
+     ```bash
+     python node.py
+     # Node ID: node-1
+     # Port: 5001
+     ```
+     Add peers at 127.0.0.1:5002 and 127.0.0.1:5003 using `[p]`.
+
+  2. **Terminal 2** — Start node-2 on port 5002:
+     ```bash
+     python node.py
+     # Node ID: node-2
+     # Port: 5002
+     ```
+     Add peers at 127.0.0.1:5001 and 127.0.0.1:5003 using `[p]`.
+
+  3. **Terminal 3** — Start node-3 on port 5003:
+     ```bash
+     python node.py
+     # Node ID: node-3
+     # Port: 5003
+     ```
+     Add peers at 127.0.0.1:5001 and 127.0.0.1:5002 using `[p]`.
+
+  4. On **node-1**, insert a value using `[i]`:
+     ```
+     key: username
+     value: alice
+     ```
+
+  5. Wait **6 seconds** (two full `GOSSIP_INTERVAL` cycles at the default of 3 seconds).
+
+  6. On each node, run `[s]` to show the current store state.
+
+  **Expected result:**
+
+  All three nodes display the same record:
+  ```python
+  {'username': ('alice', 1678156800.234, 'node-1')}
+  ```
+  The timestamp and originating node ID will match the values assigned by node-1 at insertion time. This confirms strong eventual consistency.
+</Accordion>
+
+## Scenario 4: Node Partition Recovery
+
+This scenario validates the gossip-based healing mechanism. Nodes are killed mid-operation and restarted; they must re-acquire the cluster's current state purely through the anti-entropy gossip exchange, with no centralized coordinator.
+
+**Setup:** A three-node cluster (5001, 5002, 5003) fully interconnected.
+
+<Accordion title="Scenario 4 Steps and Expected Result">
+  **Steps:**
+
+  1. Start all three nodes and interconnect them as described in Scenario 1.
+
+  2. On **node-1**, insert:
+     ```
+     key: status
+     value: active
+     ```
+
+  3. Verify all three nodes show `status = active` using `[s]`.
+
+  4. **Kill node-1 and node-3** (Ctrl+C in their terminals). Node-2 remains running.
+
+  5. On **node-2**, insert a conflicting update:
+     ```
+     key: status
+     value: standby
+     ```
+     Node-2 stores this with a newer timestamp than the original `active` write.
+
+  6. **Restart node-1 and node-3** with the same node IDs and ports. Re-add node-2 as a peer on both restarted nodes.
+
+  7. Wait **6–9 seconds** for gossip propagation.
+
+  8. Run `[s]` on all three nodes.
+
+  **Expected result:**
+
+  All nodes converge to:
+  ```python
+  {'status': ('standby', <later_ts>, 'node-2')}
+  ```
+  The restarted nodes recover the latest state entirely through gossip — no persistent log or leader election required. The `standby` value wins because its timestamp is later than `active`, satisfying the LWW conflict resolution rule.
+</Accordion>
+
+## Chaos Testing Checklist
+
+Use the following checklist to validate your Aether Sync deployment across all primary failure modes:
+
+<Accordion title="Baseline Convergence Check">
+  - [ ] Three nodes start and interconnect successfully
+  - [ ] A write on node-1 propagates to node-2 and node-3 within two gossip cycles
+  - [ ] All three `[s]` outputs are byte-for-byte identical (same value, timestamp, and node ID)
+  - [ ] No exceptions or error output in any terminal
+</Accordion>
+
+<Accordion title="Conflict Resolution Check">
+  - [ ] Two concurrent writes to the same key on different nodes converge to a single winner
+  - [ ] The winning value has the strictly later timestamp (or lexicographically larger node ID on tie)
+  - [ ] The result is identical on all nodes — no split-brain state
+</Accordion>
+
+<Accordion title="tc netem Chaos Check">
+  - [ ] `sudo tc qdisc add dev lo root netem loss 30%` applied before starting nodes
+  - [ ] Convergence still occurs within 9 seconds (3 gossip cycles)
+  - [ ] Retry loop produces retransmissions (observable as duplicate log activity)
+  - [ ] `sudo tc qdisc del dev lo root` executed after test to restore networking
+</Accordion>
+
+<Accordion title="Partition Recovery Check">
+  - [ ] Two of three nodes killed mid-operation
+  - [ ] Surviving node accepts new writes
+  - [ ] Restarted nodes recover full cluster state via gossip within two cycles
+  - [ ] No manual reconciliation step required
+</Accordion>
