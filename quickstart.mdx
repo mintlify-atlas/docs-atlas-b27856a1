@@ -1,5 +1,5 @@
 ---
-title: "Get Started with Aether Sync in Minutes"
+title: "Run Your First Three-Node Aether Sync Cluster Locally"
 sidebarTitle: "Quickstart"
 description: "Clone the repo, launch three Python processes, connect them with the peer command, and watch CRDT gossip sync state across every node automatically."
 ---
@@ -33,7 +33,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
     python node.py
     ```
 
-    ```
+    ```text
     Node ID: node-1
     Port: 5001
     [p]peer [i]put [s]show :
@@ -49,7 +49,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
     python node.py
     ```
 
-    ```
+    ```text
     Node ID: node-2
     Port: 5002
     [p]peer [i]put [s]show :
@@ -65,7 +65,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
     python node.py
     ```
 
-    ```
+    ```text
     Node ID: node-3
     Port: 5003
     [p]peer [i]put [s]show :
@@ -79,7 +79,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
 
     **In Terminal 1 (node-1)** — register node-2 and node-3 as peers:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : p
     IP: 127.0.0.1
     Port: 5002
@@ -91,7 +91,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
 
     **In Terminal 2 (node-2)** — register node-1 and node-3:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : p
     IP: 127.0.0.1
     Port: 5001
@@ -103,7 +103,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
 
     **In Terminal 3 (node-3)** — register node-1 and node-2:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : p
     IP: 127.0.0.1
     Port: 5001
@@ -119,7 +119,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
   <Step title="Write data and verify sync">
     **In Terminal 1 (node-1)**, write two key-value pairs using the `i` (insert) command:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : i
     key: username
     value: alice
@@ -131,7 +131,7 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
 
     Each `i` command calls `Store.merge()` locally, then broadcasts a reliable PUT message to every registered peer. Inspect the local store immediately on node-1 with `s`:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : s
     {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
     ```
@@ -142,14 +142,14 @@ This guide walks you through cloning Aether Sync, starting a three-node cluster 
 
     **In Terminal 2 (node-2)**, confirm convergence:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : s
     {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
     ```
 
     **In Terminal 3 (node-3)**, same check:
 
-    ```
+    ```text
     [p]peer [i]put [s]show : s
     {'username': ('alice', 1678156800.234, 'node-1'), 'email': ('alice@example.com', 1678156805.567, 'node-1')}
     ```

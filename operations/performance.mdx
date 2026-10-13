@@ -1,5 +1,5 @@
 ---
-title: "Aether Sync Performance Characteristics"
+title: "Performance Metrics and Configuration Tuning Guide"
 sidebarTitle: "Performance"
 description: "Understand Aether Sync's latency, throughput, memory usage, and fault tolerance metrics, and learn which config parameters to tune for your workload."
 ---
@@ -28,7 +28,7 @@ Three parameters in `config.py` directly control the performance envelope:
 ```python
 # config.py
 LOSS_PROB = 0.3        # Set to 0.0 in production to disable packet drop simulation
-RETRY_INTERVAL = 2     # Seconds between retransmissions; reduce for faster recovery
+RETRY_INTERVAL = 2     # Configured retry interval in seconds (reliability.py currently hardcodes 2s)
 GOSSIP_INTERVAL = 3    # Seconds between full anti-entropy broadcasts
 BUFFER_SIZE = 4096     # Maximum UDP datagram size in bytes
 ```

@@ -1,5 +1,5 @@
 ---
-title: "Node CLI: Interactive Multi-Master Node Reference"
+title: "Node CLI: Aether Sync Multi-Master Cluster Reference"
 sidebarTitle: "Node CLI"
 description: "node.py entry point for Aether Sync — covers startup prompts, interactive commands, thread architecture, and programmatic embedding in Python apps."
 ---
@@ -147,7 +147,7 @@ Once startup is complete, `node.py` enters `user_loop()` and presents an interac
 
 `node.py` starts three daemon threads before handing control to `user_loop` on the main thread:
 
-```
+```text
 ┌─────────────────────────────────┐
 │  Main thread: user_loop()       │
 │  Reads commands from stdin      │

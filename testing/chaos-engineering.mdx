@@ -1,5 +1,5 @@
 ---
-title: "Chaos Engineering with Aether Sync"
+title: "Chaos Engineering Tests for Aether Sync Resilience"
 sidebarTitle: "Chaos Engineering"
 description: "Test Aether Sync's resilience using built-in packet loss simulation and Linux tc netem to validate eventual consistency under real-world chaos."
 ---
@@ -13,7 +13,7 @@ Aether Sync ships with a software-level packet loss simulator controlled by the 
 ```python
 # config.py
 LOSS_PROB = 0.3        # 30% of outbound packets are silently dropped
-RETRY_INTERVAL = 2     # Seconds between ACK timeout and retransmission
+RETRY_INTERVAL = 2     # Configured retry interval in seconds (currently hardcoded in reliability.py)
 GOSSIP_INTERVAL = 3    # Seconds between full anti-entropy broadcasts
 BUFFER_SIZE = 4096     # Maximum UDP packet size in bytes
 ```

@@ -1,7 +1,7 @@
 ---
 title: "Configuring Aether Sync: Parameters and Tuning Guide"
 sidebarTitle: "Configuration"
-description: "Master all four config.py parameters — LOSS_PROB, RETRY_INTERVAL, GOSSIP_INTERVAL, and BUFFER_SIZE — and learn how each one shapes convergence speed, throughput, and fault tolerance."
+description: "All four config.py knobs explained: LOSS_PROB, RETRY_INTERVAL, GOSSIP_INTERVAL, and BUFFER_SIZE, with tuning profiles for LAN, WAN, and chaos testing."
 ---
 
 Aether Sync is intentionally configured through a single file: `config.py`. All four parameters live there, and changing any one of them immediately affects the behaviour of every layer — from how aggressively the transport simulates packet loss, to how quickly unacknowledged messages are retried, to the maximum payload the UDP socket will accept. There is no runtime config reload; restart the node after editing the file.
@@ -20,7 +20,7 @@ BUFFER_SIZE = 4096
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `LOSS_PROB` | `float` | `0.3` | Probability (0.0 – 1.0) that any outbound UDP packet is silently dropped by the transport layer to simulate network chaos |
-| `RETRY_INTERVAL` | `int` | `2` | Seconds the reliability layer waits before re-sending a message whose ACK has not yet arrived |
+| `RETRY_INTERVAL` | `int` | `2` | Intended retry interval in seconds. **Note**: `reliability.py` hardcodes `2` directly and does not import this constant; changing it in `config.py` has no effect without also editing `reliability.py`. |
 | `GOSSIP_INTERVAL` | `int` | `3` | Seconds between full anti-entropy state broadcasts to all known peers |
 | `BUFFER_SIZE` | `int` | `4096` | Maximum UDP receive buffer size in bytes; determines the largest serialised JSON payload the socket will accept |
 
@@ -36,11 +36,15 @@ BUFFER_SIZE = 4096
 </ParamField>
 
 <ParamField path="RETRY_INTERVAL" type="int" default="2">
-  How long (in seconds) the reliability layer waits after sending a `PUT` message before concluding the ACK was lost and re-transmitting the same sequence number.
+  Intended interval in seconds between ACK timeout and message re-transmission, as defined in `config.py`.
 
-  - The retry loop wakes every **1 second** (hard-coded in `node.py`) and checks all pending messages whose last-send timestamp is older than `RETRY_INTERVAL`
-  - Lowering this value increases re-transmission aggressiveness, which helps under high loss but adds network overhead
-  - Raising this value reduces retry traffic at the cost of slower delivery confirmation
+  <Warning>
+    **Implementation note**: `reliability.py` does **not** import `RETRY_INTERVAL` from `config.py`. The threshold used inside `Reliability.retry()` is the hardcoded literal `2` — `if now - t > 2`. Changing `RETRY_INTERVAL` in `config.py` has no runtime effect on the current codebase. The value is imported by `node.py` but is not passed through to `Reliability`. To actually change the retry threshold you must edit the literal `2` in `reliability.py` directly.
+  </Warning>
+
+  - The retry loop in `node.py` wakes every **1 second** (hard-coded) and calls `reliability.retry()`, which then checks whether `now - last_send_time > 2`
+  - Lowering the hardcoded `2` in `reliability.py` increases re-transmission aggressiveness, which helps under high loss but adds network overhead
+  - Raising it reduces retry traffic at the cost of slower delivery confirmation
   - At the default `LOSS_PROB = 0.3`, expect **3 – 5 retry attempts** on average before an ACK is received
 </ParamField>
 

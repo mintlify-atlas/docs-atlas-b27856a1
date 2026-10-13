@@ -1,7 +1,7 @@
 ---
 title: "Aether Sync Data Model: LWW Records and Conflict Resolution"
 sidebarTitle: "Data Model"
-description: "Understand the 3-tuple (value, timestamp, node_id) record structure, how Last-Write-Wins CRDT semantics resolve concurrent writes, and the idempotency guarantees that make gossip retransmission safe."
+description: "How Aether Sync stores state: the 3-tuple record format, LWW conflict resolution by timestamp and node ID, idempotent merges, and key naming conventions."
 ---
 
 Aether Sync models distributed state as a **Last-Write-Wins (LWW) Element Dictionary**, one of the simplest and most practical Conflict-free Replicated Data Types (CRDTs). Every node maintains an identical logical structure: a plain Python dictionary whose keys are strings and whose values are fixed-shape 3-tuples. No master node arbitrates writes; any node can write any key at any time, and the merge function guarantees that all nodes converge to the same state regardless of the order in which they receive updates.
@@ -106,7 +106,7 @@ store.merge({"score": ("200", 1678156802.0, "node-2")})
 
 Aether Sync imposes no structure on key strings; they are plain Python `str` values. The colon-separated namespace convention used in the README and examples is a recommended pattern:
 
-```
+```text
 <entity-type>:<entity-id>:<attribute>
 ```
 

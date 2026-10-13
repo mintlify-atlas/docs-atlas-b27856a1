@@ -1,24 +1,32 @@
 ---
-title: "Embedding Aether Sync in Python Applications"
+title: "Integrating Aether Sync into Your Python Application"
 sidebarTitle: "Integration"
 description: "Embed Aether Sync into Python applications for programmatic distributed state sync, state persistence, and multi-threaded cluster participation."
 ---
 
-Aether Sync is designed to be embedded as a library inside any Python 3.7+ application, not only run as a standalone interactive process. Because every component — the transport socket, the reliability tracker, the LWW store, and the gossip loop — is an ordinary Python object or function, you can import them directly from `node.py` and `gossip.py`, wire up the three daemon threads yourself, and use the store's public API (`merge`, `get_all`) from the rest of your code without touching the interactive user loop at all.
+Aether Sync is designed to be embedded as a library inside any Python 3.7+ application, not only run as a standalone interactive process. Every component — the transport socket, the reliability tracker, the LWW store, and the gossip loop — is an ordinary Python object or function that you can instantiate directly. Because `node.py` calls `input()` at module level to prompt for a node ID and port, you **cannot** import from it programmatically without blocking; instead, instantiate `Transport`, `Reliability`, and `Store` directly, start the three daemon threads yourself, and use the store's public API (`merge`, `get_all`) from the rest of your code.
 
 ## Basic Embedding
 
-The snippet below mirrors the integration example from the README and shows the minimum wiring needed to join a cluster, pre-seed the store with a value, and read it back.
+The snippet below shows the minimum wiring needed to join a cluster, pre-seed the store with a value, and read it back. Components are instantiated directly — do **not** import from `node.py` because it calls `input()` at module level and will block the process immediately on import.
 
 ```python
 import time
 import threading
-from node import transport, store, reliability, peers
+from transport import Transport
+from reliability import Reliability
+from store import Store
 from gossip import gossip_loop
 
 # ── Identity ────────────────────────────────────────────
 node_id = "my-service-1"
 port    = 5001
+
+# ── Instantiate components directly ─────────────────────
+transport   = Transport(port)
+reliability = Reliability(transport)
+store       = Store()
+peers       = []
 
 # ── Peer registration ───────────────────────────────────
 peers.append(("192.168.1.2", 5001))
@@ -41,24 +49,50 @@ print(config["config:db_host"])
 
 ## Thread Architecture
 
-Aether Sync requires three long-running daemon threads to be active for a node to fully participate in the cluster. When you run `node.py` directly these are started for you at the bottom of the file; when embedding you must start them yourself before your application enters its main loop.
+Aether Sync requires three long-running daemon threads to be active for a node to fully participate in the cluster. When you run `node.py` directly these are started for you at the bottom of the file; when embedding you must define and start them yourself before your application enters its main loop. The listener and retry functions are simple loops that operate on the shared `transport`, `reliability`, and `store` objects you instantiate.
 
 ```python
+import time
 import threading
-from node import transport, store, reliability, listener, retry_loop
+from transport import Transport
+from reliability import Reliability
+from store import Store
 from gossip import gossip_loop
-from node import peers
 
-# 1. Listener — receives all incoming UDP messages and dispatches
-#    PUT / GOSSIP / ACK to the appropriate handler.
+node_id     = "my-service-1"
+transport   = Transport(5001)
+reliability = Reliability(transport)
+store       = Store()
+peers       = []
+
+# ── 1. Listener ─────────────────────────────────────────
+# Receives all incoming UDP messages and dispatches
+# PUT / GOSSIP / ACK to the appropriate handler.
+def listener():
+    while True:
+        msg, addr = transport.recv()
+        if msg["type"] == "PUT":
+            store.merge({msg["key"]: (msg["value"], msg["ts"], msg["from"])})
+            transport.unreliable_send({"type": "ACK", "seq": msg["seq"]}, addr)
+        elif msg["type"] == "GOSSIP":
+            store.merge(msg["store"])
+        elif msg["type"] == "ACK":
+            reliability.handle_ack(msg["seq"])
+
+# ── 2. Retry loop ───────────────────────────────────────
+# Wakes every second, re-sends any PUT that has not been
+# ACK-ed within RETRY_INTERVAL (default 2 s).
+def retry_loop():
+    while True:
+        time.sleep(1)
+        reliability.retry()
+
 threading.Thread(target=listener,   daemon=True).start()
-
-# 2. Retry loop — wakes every second, re-sends any PUT or GOSSIP
-#    that has not been ACK-ed within RETRY_INTERVAL (default 2 s).
 threading.Thread(target=retry_loop, daemon=True).start()
 
-# 3. Gossip loop — broadcasts the full store snapshot to every
-#    peer every GOSSIP_INTERVAL seconds (default 3 s).
+# ── 3. Gossip loop ──────────────────────────────────────
+# Broadcasts the full store snapshot to every peer every
+# GOSSIP_INTERVAL seconds (default 3 s).
 threading.Thread(
     target=gossip_loop,
     args=(peers, store, reliability),
@@ -68,11 +102,11 @@ threading.Thread(
 
 All three threads are marked `daemon=True`, which means they are automatically killed when the main thread exits — no explicit shutdown logic is required for clean process termination.
 
-| Thread | Source | Responsibility |
-|--------|--------|----------------|
-| `listener` | `node.py` | Blocks on `transport.recv()`; dispatches PUT / GOSSIP / ACK |
-| `retry_loop` | `node.py` | Polls `reliability.pending` every 1 s; re-sends stale messages |
-| `gossip_loop` | `gossip.py` | Sleeps `GOSSIP_INTERVAL` s; broadcasts `GOSSIP` to all peers |
+| Thread | Defined in | Responsibility |
+|--------|-----------|----------------|
+| `listener` | your embedding code (mirrors `node.py` logic) | Blocks on `transport.recv()`; dispatches PUT / GOSSIP / ACK |
+| `retry_loop` | your embedding code (mirrors `node.py` logic) | Polls `reliability.retry()` every 1 s; re-sends stale messages |
+| `gossip_loop` | `gossip.py` | Sleeps `GOSSIP_INTERVAL` s; broadcasts full store to all peers |
 
 <Note>
   The listener thread performs blocking I/O on a single UDP socket. It processes one message at a time, so avoid doing expensive work inside `Store.merge()` — the lock is held for the duration of each merge.

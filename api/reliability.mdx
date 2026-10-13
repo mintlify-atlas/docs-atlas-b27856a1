@@ -152,5 +152,5 @@ reliability.handle_ack(seq=1)
 </Warning>
 
 <Note>
-  The retry interval is a fixed **2 seconds** (hardcoded in `retry()`), independent of the `RETRY_INTERVAL` value in `config.py`. `RETRY_INTERVAL` controls how often `node.py`'s `retry_loop` thread calls `reliability.retry()` — currently set to `1` second — not the per-message backoff window.
+  The retry interval is a fixed **2 seconds**, hardcoded directly in `retry()` as `if now - t > 2`. The `RETRY_INTERVAL` constant in `config.py` (value `2`) is imported by `node.py` but is **not** used to control either the `retry_loop` sleep duration or the per-message backoff threshold — `retry_loop` calls `time.sleep(1)` unconditionally. Both the sleep period and the backoff threshold are independent hardcoded values in the current implementation.
 </Note>

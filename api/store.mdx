@@ -1,5 +1,5 @@
 ---
-title: "Store Module: CRDT LWW Dictionary API Reference"
+title: "Store Module: CRDT LWW State Dictionary API Reference"
 sidebarTitle: "Store"
 description: "Thread-safe CRDT Last-Write-Wins dictionary API for Aether Sync — covers Store class methods, merge conflict resolution, and local write operations."
 ---
@@ -78,10 +78,10 @@ The entire merge loop is wrapped in `self.lock`, so concurrent calls from the li
 
 ### `Store.put_local(key, record)`
 
-Writes a single record directly into the store, bypassing merge conflict resolution entirely. This is the path used by `node.py`'s `user_loop` after the user inserts a key — the record is written locally before it is broadcast to peers, so the local node reflects the change immediately regardless of any in-flight gossip.
+Writes a single record directly into the store, bypassing merge conflict resolution entirely. The write is protected by `self.lock` for thread safety, but unlike `merge`, no timestamp or node-ID comparison is performed — the incoming record unconditionally replaces whatever was previously stored under `key`. This is appropriate for snapshot restoration or test setup, not for normal writes during cluster operation. For ordinary key insertions, `node.py`'s `user_loop` calls `store.merge({k: (v, ts, NODE_ID)})` rather than `put_local`, so that LWW conflict resolution is still applied.
 
 <ParamField body="key" type="str" required>
-  The key to write. Must be a non-empty string. `node.py` validates that the key is not empty before calling this method.
+  The key to write. Must be a non-empty string. This method writes the record directly into `self.data` without any conflict-resolution check — use it only when you are certain the provided record is already the correct authoritative value (for example, during store restoration from a snapshot).
 </ParamField>
 
 <ParamField body="record" type="tuple" required>
@@ -89,7 +89,7 @@ Writes a single record directly into the store, bypassing merge conflict resolut
 
   - **value** (`str`) — The payload.
   - **timestamp** (`float`) — `time.time()` at the moment of the local write.
-  - **node_id** (`str`) — The local `NODE_ID`, set at startup.
+  - **node_id** (`str`) — The originating node's identifier. Used as a tie-breaker in future `merge` calls if this record is later received by a peer.
 </ParamField>
 
 <ResponseField name="(no return value)" type="None">

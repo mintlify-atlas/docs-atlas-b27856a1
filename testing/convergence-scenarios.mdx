@@ -1,5 +1,5 @@
 ---
-title: "Testing Convergence and Conflict Resolution"
+title: "Testing Eventual Consistency and Conflict Resolution"
 sidebarTitle: "Convergence Scenarios"
 description: "Verify Aether Sync's eventual consistency guarantees and LWW conflict resolution by running concurrent writes and inspecting per-node state."
 ---
@@ -98,8 +98,7 @@ The time to reach full cluster agreement depends primarily on `GOSSIP_INTERVAL` 
 |-----------|-----------------|-------|
 | 30% packet loss (default) | 6–9 seconds | 2–3 gossip cycles required for reliable delivery |
 | 0% packet loss (`LOSS_PROB = 0.0`) | 3–6 seconds | 1–2 gossip cycles; first PUT broadcast often sufficient |
-| 60% packet loss | 9–15 seconds | 3–5 gossip cycles; retry loop becomes the primary delivery mechanism |
-| `tc netem loss 30%` on loopback | 6–12 seconds | Kernel-level drops stack with `LOSS_PROB`; combined effective loss is higher |
+| `tc netem loss 30%` on loopback | Longer than 6–9 seconds | Kernel-level drops compound with `LOSS_PROB`; exact timing depends on effective combined loss rate |
 
 <Info>
   `GOSSIP_INTERVAL` is the single most impactful tuning knob for convergence speed. Halving it from 3 seconds to 1.5 seconds cuts the worst-case convergence window roughly in half. However, it also doubles the steady-state network overhead: each gossip cycle broadcasts the full store (~3 KB per cycle), so aggressive intervals can saturate low-bandwidth links. See [Performance Characteristics](/operations/performance) for the full trade-off analysis.

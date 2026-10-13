@@ -1,5 +1,5 @@
 ---
-title: "Aether Sync Message Protocol Reference"
+title: "Aether Sync Wire Protocol: Message Field Reference"
 sidebarTitle: "Messages"
 description: "Reference for Aether Sync's three UDP message types — PUT, GOSSIP, and ACK — covering field definitions, JSON wire format, and delivery semantics."
 ---
@@ -99,7 +99,7 @@ A `GOSSIP` message carries a complete snapshot of the sender's LWW store. It is 
   | `2` | string | Node ID of the originating writer |
 </ResponseField>
 
-**Semantics:** Upon receipt, the listener calls `store.merge(msg["store"])` directly — no ACK is sent for the merge itself, but the underlying transport-level ACK (triggered by the `seq` field added by the reliability layer) is still returned so the sender can clear the message from its retry queue. Because the merge is idempotent, receiving the same GOSSIP message multiple times produces no change. This makes gossip-based anti-entropy safe to combine with the retry loop without risk of data corruption or duplication.
+**Semantics:** Upon receipt, the listener calls `store.merge(msg["store"])` directly and returns — **no ACK is sent** for a GOSSIP message. The listener in `node.py` only emits an ACK in the `PUT` branch; the `GOSSIP` branch performs only the merge. As a result, GOSSIP messages sent via `reliability.reliable_send()` are retried indefinitely at `RETRY_INTERVAL`-second intervals until the sender's process restarts or the entry is manually cleared. Because the merge is idempotent, receiving the same GOSSIP message multiple times produces no change, so duplicate delivery causes no data corruption — only minor extra CPU and network overhead.
 
 <Note>
   The GOSSIP message carries the **full** store snapshot, not a delta. For clusters with large data sets this can approach `BUFFER_SIZE` (4 096 bytes). If your store exceeds this limit, the UDP packet will be silently truncated. Consider sharding keys across multiple logical stores or increasing `BUFFER_SIZE` in `config.py`.
@@ -109,7 +109,7 @@ A `GOSSIP` message carries a complete snapshot of the sender's LWW store. It is 
 
 ## ACK Message
 
-An ACK message is the lightest message in the protocol. It is generated inline by the listener thread in `node.py` immediately after a `PUT` is processed, and sent back to the originating address using `transport.unreliable_send()` — meaning ACKs themselves are **not** retried and are **not** sequenced.
+An ACK message is the lightest message in the protocol. It is generated inline by the listener thread in `node.py` immediately after a `PUT` is processed and merged, then sent back to the originating address using `transport.unreliable_send()` — meaning ACKs themselves are **not** retried and are **not** sequenced. Note that the listener does **not** explicitly send an ACK for `GOSSIP` messages; only `PUT` messages receive this acknowledgment.
 
 ```json
 {
@@ -123,7 +123,7 @@ An ACK message is the lightest message in the protocol. It is generated inline b
 </ResponseField>
 
 <ResponseField name="seq" type="integer" required>
-  The sequence number of the message being acknowledged. This value is copied verbatim from the `seq` field of the PUT or GOSSIP being confirmed. `Reliability.handle_ack()` uses it as a key to delete the corresponding entry from the `pending` dict, halting further retries.
+  The sequence number of the PUT message being acknowledged. This value is copied verbatim from the `seq` field of the incoming `PUT` that the listener just merged. `Reliability.handle_ack()` uses it as a key to delete the corresponding entry from the `pending` dict, halting further retries for that sequence number.
 </ResponseField>
 
 **Semantics:** An ACK confirms that the receiver has successfully processed and merged the message identified by `seq`. Because ACKs travel over `unreliable_send()`, an ACK can itself be dropped. In that case the sender's retry loop will resend the original message after `RETRY_INTERVAL` seconds (default 2 s); the receiver will process the duplicate, find no new information in the LWW merge, and send another ACK. This cycle terminates as soon as one ACK survives the network.

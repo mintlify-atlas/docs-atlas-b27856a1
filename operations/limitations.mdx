@@ -1,5 +1,5 @@
 ---
-title: "Aether Sync: Known Limitations and Future Roadmap"
+title: "Aether Sync Known Limitations and Planned Improvements"
 sidebarTitle: "Limitations"
 description: "Understand Aether Sync's known constraints as a reference implementation and the planned improvements that would make it production-ready."
 ---
@@ -94,11 +94,16 @@ Aether Sync is a reference implementation built to demonstrate the interplay bet
 </Accordion>
 
 <Accordion title="4. Naive Retry Strategy">
-  **What it means:** The reliability layer retransmits unacknowledged messages on a fixed `RETRY_INTERVAL` of 2 seconds with no backoff, no jitter, and no maximum retry count:
+  **What it means:** The reliability layer retransmits unacknowledged messages on a fixed 2-second interval with no backoff, no jitter, and no maximum retry count. Although `config.py` defines `RETRY_INTERVAL = 2`, the threshold is hardcoded directly in `reliability.py` and `reliability.py` does not import `RETRY_INTERVAL`:
 
   ```python
-  # config.py
-  RETRY_INTERVAL = 2    # Fixed 2-second retry interval — no exponential backoff
+  # reliability.py — retry threshold hardcoded to 2 seconds
+  def retry(self):
+      now = time.time()
+      for s, (m, a, t) in list(self.pending.items()):
+          if now - t > 2:          # hardcoded — not read from config
+              self.pending[s] = (m, a, now)
+              self.transport.unreliable_send(m, a)
   ```
 
   Under high packet loss, all retrying nodes fire retransmissions at the same fixed cadence. This creates synchronized retry storms: every 2 seconds, every node floods the network with all its pending messages simultaneously, which can temporarily worsen congestion and cause further packet loss.
